@@ -743,11 +743,15 @@ config_list()
     for conf in "${CONFIG_DIR}"/*.conf; do
         [ -e "${conf}" ] || continue
         count=$((count+1))
-        (
-            unset DISTRIB ARCH SUITE CHROOT_DIR INCLUDE
-            . "${conf}"
-            msg "$(printf "%-18s %-10s %-8s %-8s %s" "$(basename "${conf}" .conf)" "${DISTRIB}" "${ARCH}" "${SUITE}" "${CHROOT_DIR}")"
-        )
+        # 参数化读取展示字段（不用 . "${conf}" source：配置文件可被用户/前端
+        # 写入，source 会执行其中任意 shell 代码；与 --json 分支保持一致）
+        local name distrib arch suite chroot_dir
+        name=$(basename "${conf}" .conf)
+        distrib=$(grep '^DISTRIB=' "${conf}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        arch=$(grep '^ARCH=' "${conf}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        suite=$(grep '^SUITE=' "${conf}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        chroot_dir=$(grep '^CHROOT_DIR=' "${conf}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        msg "$(printf "%-18s %-10s %-8s %-8s %s" "${name}" "${distrib}" "${arch}" "${suite}" "${chroot_dir}")"
     done
     msg "--------------------------------------------------------------"
     msg "共 ${count} 个配置"
@@ -1818,7 +1822,10 @@ container_status()
         multiarch_support && binfmt=true
         supported_fs=$(printf '%s ' $(grep -v nodev /proc/filesystems | sort))
         if [ -r "${CHROOT_DIR}/etc/os-release" ]; then
-            installed=$(. "${CHROOT_DIR}/etc/os-release" 2>/dev/null; printf '%s' "${PRETTY_NAME:-未知}")
+            # 参数化读取 PRETTY_NAME（不用 . source：os-release 来自导入的
+            # rootfs，内容外部可控，source 会执行其中任意 shell 代码）
+            installed=$(grep '^PRETTY_NAME=' "${CHROOT_DIR}/etc/os-release" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+            [ -n "${installed}" ] || installed="未知"
         fi
         # running 判定：ldstatus 标记进程（跨命名空间）为主，挂载兜底（旧容器无标记）
         container_mounted >/dev/null 2>&1 && mounted=true
@@ -1890,7 +1897,12 @@ container_status()
     msg "${supported_fs}"
 
     msg -n "已安装系统: "
-    local linux_version=$([ -r "${CHROOT_DIR}/etc/os-release" ] && . "${CHROOT_DIR}/etc/os-release"; [ -n "${PRETTY_NAME}" ] && echo "${PRETTY_NAME}" || echo "未知")
+    # 参数化读取 PRETTY_NAME（不用 . source os-release，理由同上）
+    local linux_version="未知"
+    if [ -r "${CHROOT_DIR}/etc/os-release" ]; then
+        linux_version=$(grep '^PRETTY_NAME=' "${CHROOT_DIR}/etc/os-release" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        [ -n "${linux_version}" ] || linux_version="未知"
+    fi
     msg "${linux_version}"
 
     msg -n "运行状态: "
