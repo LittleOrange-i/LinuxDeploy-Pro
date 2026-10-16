@@ -37,6 +37,7 @@ msg()
 # 注意：管道会吞掉退出码，需配合 log_exec 或在外部自行捕获。
 log_stream()
 {
+    local line
     while IFS= read -r line || [ -n "${line}" ]
     do
         # 去掉回车符（debootstrap 进度条用 \r 刷新行）
@@ -46,6 +47,7 @@ log_stream()
             printf '%s %s\n' "$(date '+%F %T')" "${line}" >> "${LOG_FILE}"
         fi
     done
+    return ${PIPESTATUS[0]}  # 返回真实退出码（防止被管道吞掉）
 }
 
 # 归一化软件包列表：兼容空格 / 半角逗号 / 全角逗号 / 顿号 / 分号分隔，统一转成空格。
@@ -67,14 +69,79 @@ log_exec()
 {
     local rc_file rc
     rc_file=$(mktemp) || return 1
+    # 保存调用方已有的 EXIT trap（部署流程依赖 deploy_cleanup 兜底），
+    # 用完后原样恢复——直接 trap/覆盖会让部署失败时漏卸载残留挂载
+    local prev_trap=""
+    prev_trap=$(trap -p EXIT)
+    trap 'rm -f "${rc_file}"' EXIT
     (
         "$@" 2>&1
         echo $? > "${rc_file}"
     ) | log_stream
-    rc=$(cat "${rc_file}")
+    rc=$(cat "${rc_file}" 2>/dev/null)
     rm -f "${rc_file}"
+    # 恢复调用方原有 EXIT trap（无则清除）
+    if [ -n "${prev_trap}" ]; then
+        eval "${prev_trap}"
+    else
+        trap - EXIT
+    fi
+    [ -n "${rc}" ] || rc=${PIPESTATUS[0]:-0}
     return ${rc}
 }
+
+# 安全变量赋值（替代 eval ${key}="${val}"，杜绝值中的命令注入）
+# 后端选择（探测一次，全程复用）：
+#   declare —— bash：declare -g 直接赋值，无二次解析
+#   nameref —— mksh（Android /system/bin/sh）：别名赋值，无二次解析
+#   evalesc —— 两者都没有的老 shell：转义全部元字符后用 eval，等价字面赋值
+# 三种后端都不会执行值中的 $()、反引号、引号、分号。
+# 入参：$1 变量名（调用方须已校验 ^[0-9A-Z_]{1,32}$），$2 值
+ld_set_var()
+{
+    case "${LD_VAR_BACKEND:-declare}" in
+    nameref)
+        nameref ld_ref="$1" 2>/dev/null
+        ld_ref="$2"
+    ;;
+    evalesc)
+        local esc
+        esc=$(printf '%s' "$2" | sed 's/\([\\$`"]\)/\\\1/g')
+        eval "$1=\"${esc}\""
+    ;;
+    *)
+        declare -g "$1=$2" 2>/dev/null
+    ;;
+    esac
+}
+
+# 安全读取变量值（替代 eval "val=\$${key}" 间接展开），值输出到 stdout
+ld_get_var()
+{
+    case "${LD_VAR_BACKEND:-declare}" in
+    nameref)
+        nameref ld_ref="$1" 2>/dev/null
+        printf '%s' "${ld_ref:-}"
+    ;;
+    evalesc)
+        # 键名已限定 [0-9A-Z_]{1,32}，无注入面
+        eval "printf '%s' \"\${$1:-}\""
+    ;;
+    *)
+        declare -n ld_ref="$1" 2>/dev/null
+        printf '%s' "${ld_ref:-}"
+    ;;
+    esac
+}
+
+# shell 能力探测（仅执行一次）：决定 ld_set_var/ld_get_var 的后端
+if [ -n "${BASH_VERSION:-}" ]; then
+    LD_VAR_BACKEND="declare"
+elif nameref _ld_probe=LD_PROBE_TARGET 2>/dev/null; then
+    LD_VAR_BACKEND="nameref"
+else
+    LD_VAR_BACKEND="evalesc"
+fi
 
 # JSON 字符串转义（--json 模式输出安全字段）
 json_escape()
@@ -94,14 +161,18 @@ log_open()
 {
     local name="${1:-default}"
     LOG_DIR="${LOG_DIR:-${BUILD_DIR}/logs}"
-    mkdir -p "${LOG_DIR}" 2>/dev/null
+    mkdir -p "${LOG_DIR}" 2>/dev/null || { msg "[错误] 无法创建日志目录：${LOG_DIR}"; return 1; }
     # 时间戳命名（配置名-日期-时分秒）：每次操作独立日志文件，前端按最新文件尾随展示。
     LOG_FILE="${LOG_DIR}/${name}-$(date '+%Y%m%d-%H%M%S').log"
-    : > "${LOG_FILE}"
+    : > "${LOG_FILE}" || { msg "[错误] 无法创建日志文件：${LOG_FILE}"; return 1; }
     # 日志文件 chown 给应用，使其可读取/删除
     if [ -n "${APP_UID}" ]; then
-        chown "${APP_UID}" "${LOG_FILE}" 2>/dev/null || true
-        chown "${APP_UID}" "${LOG_DIR}" 2>/dev/null || true
+        if ! chown "${APP_UID}" "${LOG_FILE}" 2>/dev/null; then
+            msg "[警告] chown ${APP_UID} ${LOG_FILE}失败"
+        fi
+        if ! chown "${APP_UID}" "${LOG_DIR}" 2>/dev/null; then
+            msg "[警告] chown ${APP_UID} ${LOG_DIR}失败"
+        fi
     fi
     msg "日志文件: ${LOG_FILE}"
 }
@@ -193,9 +264,22 @@ user_shell()
 }
 
 # 判断路径是否已挂载
+# realpath 解析结果按进程内缓存：同一路径重复查询（如容器启动时的多点位
+# 轮询）只 fork 一次 readlink，避免频繁调用时的重复解析开销。
+# 注意：只缓存"路径→realpath"映射（稳定），挂载状态始终实时读 /proc/mounts。
 is_mounted()
 {
-    grep -q " $(readlink -f "$1") " /proc/mounts
+    local target="$1" real
+    [ -n "${target}" ] || return 1
+    if [ "${_LD_MNT_KEY:-}" = "${target}" ]; then
+        real="${_LD_MNT_REAL:-}"
+    else
+        real=$(readlink -f "${target}" 2>/dev/null)
+        _LD_MNT_KEY="${target}"
+        _LD_MNT_REAL="${real}"
+    fi
+    [ -n "${real}" ] || real="${target}"
+    grep -q " ${real} " /proc/mounts
 }
 
 # 判断路径是否为归档文件
@@ -211,13 +295,22 @@ is_archive()
 }
 
 # 获取容器内运行的进程 PID 列表
+# 逐个 readlink /proc/<pid>/root 匹配容器目录：不依赖 ls -l 的输出格式
+# （locale/列宽变化会破坏 grep/sed 解析），也不必一次性物化全部进程的长列表
 get_pids()
 {
-    # 列出 chroot 进容器目录的进程 pid（按 /proc/<pid>/root 软链目标匹配），
-    # 用一次 ls -l 批量列出，避免逐进程 fork。
-    ls -l /proc/[0-9]*/root 2>/dev/null \
-        | grep " -> ${CHROOT_DIR%/}\$" \
-        | sed 's#^.*/proc/\([0-9][0-9]*\)/root.*#\1#'
+    local pid_dir pid target
+    target="${CHROOT_DIR%/}"
+    [ -n "${target}" ] || return 0
+    for pid_dir in /proc/[0-9]*
+    do
+        [ -e "${pid_dir}/root" ] || continue
+        pid="${pid_dir#/proc/}"
+        if [ "$(readlink "${pid_dir}/root" 2>/dev/null)" = "${target}" ]; then
+            echo "${pid}"
+        fi
+    done
+    return 0
 }
 
 # 判断容器是否已启动（存在相关进程）
@@ -262,7 +355,8 @@ ldstatus_running()
 kill_pids()
 {
     local items="$@"
-    local item pid
+    local item pid killed=0
+    local failed_pids=""
     # 第一轮：对所有存活 pid 发 TERM（不逐进程 sleep）
     for item in ${items}
     do
@@ -273,7 +367,13 @@ kill_pids()
             pid=$(head -1 "${item}" 2>/dev/null | tr -cd '0-9')
         fi
         [ -n "${pid}" ] || continue
-        kill -0 "${pid}" 2>/dev/null && kill "${pid}" 2>/dev/null
+        if kill -0 "${pid}" 2>/dev/null; then
+            if kill "${pid}" 2>/dev/null; then
+                killed=$((killed+1))
+            else
+                failed_pids="${failed_pids} ${pid}"
+            fi
+        fi
     done
     # 统一等 1 秒（不是每进程 1 秒，避免 N 进程 N 秒），再对仍未退出的发 KILL
     sleep 1
@@ -285,10 +385,19 @@ kill_pids()
             pid=$(head -1 "${item}" 2>/dev/null | tr -cd '0-9')
         fi
         [ -n "${pid}" ] || continue
-        kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null
+        if kill -0 "${pid}" 2>/dev/null; then
+            if kill -9 "${pid}" 2>/dev/null; then
+                killed=$((killed+1))
+            else
+                failed_pids="${failed_pids} ${pid}"
+            fi
+        fi
     done
-    # 清理是尽力而为，进程已不存在/无权限 kill 都不算失败
-    return 0
+    # 终止失败的 pid 明确告警并计入返回值（原实现恒返回 0，
+    # 且告警语句位于 return 之后不可达，失败完全不可见）
+    [ -n "${failed_pids}" ] && msg "[警告] 以下进程终止失败:${failed_pids}"
+    # 清理是尽力而为：进程本就不存在不算失败；无失败项即成功
+    [ -z "${failed_pids}" ] && return 0 || return 1
 }
 
 # 删除文件列表
@@ -395,7 +504,14 @@ statx_shim_cleanup()
 statx_shim_prepare()
 {
     kernel_need_statx_shim || return 0
-    statx_shim_ensure_compiled || return 0
+    # 内核需要 shim 但编译失败时明确失败（fail-fast）：
+    # 旧内核 + 无 gcc + 无预编译 shim 时若静默继续，部署会拖到 debootstrap
+    # 阶段才因缺少 STATX_MNT_ID 报错，用户难以定位。此处提前中断并给出解法。
+    if ! statx_shim_ensure_compiled; then
+        msg "[错误] 当前内核（$(uname -r 2>/dev/null | cut -d. -f1-2)）缺少 STATX_MNT_ID，需要 statx 兼容层，但编译失败。"
+        msg "       解决：安装 gcc 后重试，或把预编译的 statx_shim.so 放到 ${TEMP_DIR}/statx_shim.so。"
+        return 1
+    fi
     statx_shim_install || true
     return 0
 }
@@ -434,12 +550,10 @@ chroot_exec()
         fi
     else
         if [ -n "${shim_preload}" ]; then
-            # 导出变量让 chroot 内进程继承（ld.so 会在容器内解析该路径），
-            # 只对本次 chroot 生效，执行完立即撤销
-            export LD_PRELOAD="${shim_lib}"
-            PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" "$@" 3>&-
+            # 局部变量作用域：仅在本次 chroot 调用期间设置 LD_PRELOAD
+            # 用 (subshell) 包裹确保环境变量不会污染父 shell 或其他并发调用
+            ( export LD_PRELOAD="${shim_lib}"; PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" "$@" 3>&- )
             local rc=$?
-            unset LD_PRELOAD
             return ${rc}
         fi
         # 用 "$@" 保持参数边界，避免命令串被二次解析。
@@ -462,8 +576,17 @@ params_read()
         # 仅接受全大写字母、数字、下划线的键名，防止注入
         key=$(echo "${item}" | grep -o '^[0-9A-Z_]\{1,32\}')
         val=${item#${key}=}
+        # 剥掉值外层的一对引号：兼容 params_write 生成的 KEY="value" 格式
+        # 与手写配置的单引号形式（原 eval 版本靠 eval 解析副作用剥引号，
+        # 安全赋值后需显式处理，保证读入的值与配置文本一致）
+        val=${val#\"}
+        val=${val%\"}
+        val=${val#\'}
+        val=${val%\'}
         if [ -n "${key}" ]; then
-            eval ${key}="${val}"
+            # 安全赋值：declare/nameref，值不再被二次解析（原 eval ${key}="${val}"
+            # 在值含 $()、反引号、引号时可执行任意命令）
+            ld_set_var "${key}" "${val}"
             if [ -n "${OPTLST##* ${key} *}" ]; then
                 OPTLST="${OPTLST}${key} "
             fi
@@ -483,7 +606,8 @@ params_write()
         echo "# ${conf_file##*/} $(date '+%F %R')"
         for key in ${OPTLST}
         do
-            eval "val=\$${key}"
+            # 安全间接读取（替代 eval "val=\$${key}"）
+            val=$(ld_get_var "${key}")
             if [ -n "${key}" ] && [ -n "${val}" ]; then
                 echo "${key}=\"${val}\""
             fi
@@ -508,7 +632,9 @@ params_parse()
                 val=$(expr "${item}" : '--[0-9a-z-]\{1,32\}=\(.*\)')
             fi
             if [ -n "${key}" ]; then
-                eval ${key}=\"${val}\"
+                # 安全赋值：值含引号/命令替换也按字面处理（原 eval ${key}=\"${val}\"
+                # 在值含 "、$() 等字符时可执行任意命令）
+                ld_set_var "${key}" "${val}"
                 OPTIND=$((OPTIND+1))
                 if [ -n "${OPTLST##* ${key} *}" ]; then
                     OPTLST="${OPTLST}${key} "
@@ -525,7 +651,8 @@ params_check()
     local key val params_lost
     for key in ${params_list}
     do
-        eval "val=\$${key}"
+        # 安全间接读取（替代 eval "val=\$${key}"）
+        val=$(ld_get_var "${key}")
         if [ -z "${val}" ]; then
             params_lost="${params_lost} ${key}"
         fi
@@ -547,6 +674,8 @@ require_config()
 }
 
 # 校验配置名并返回配置文件路径
+# 名称不含 / 时拼接 CONFIG_DIR；含 / 时按完整路径透传（高级用法），
+# 但一律拒绝路径遍历（.. / ./ 分量），防止 ../../etc/passwd.conf 之类注入
 config_file_of()
 {
     local name="$1"
@@ -554,6 +683,12 @@ config_file_of()
     if [ -n "${name##*/*}" ]; then
         echo "${CONFIG_DIR}/${name}.conf"
     else
+        case "/${name}/" in
+        */../*|*/./*)
+            msg "非法的配置路径（含路径遍历）: ${name}"
+            return 1
+        ;;
+        esac
         echo "${name}"
     fi
 }
@@ -778,22 +913,23 @@ config_delete()
         purge="true"
     fi
 
-    # 读取该配置的容器目录
+    # 读取该配置的容器目录（参数化解析，不用 eval：
+    # 配置文件若被植入 CHROOT_DIR=x; rm -rf / 之类内容会直接执行）
     conf_file chroot_dir
     local conf_file=$(config_file_of "${name}")
     local chroot_dir=""
     if [ -e "${conf_file}" ]; then
-        eval $(grep '^CHROOT_DIR=' "${conf_file}")
+        chroot_dir=$(grep '^CHROOT_DIR=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
     fi
 
     msg "即将删除配置: ${name}"
     msg "配置文件: ${conf_file}"
     if [ "${purge}" = "true" ]; then
-        msg "警告: --purge 将连同容器目录一起删除: ${CHROOT_DIR}"
+        msg "警告: --purge 将连同容器目录一起删除: ${chroot_dir}"
         confirm_yes "确认删除配置及容器目录？" || { msg "已取消。"; return 1; }
-        if [ -n "${CHROOT_DIR}" ] && [ -d "${CHROOT_DIR}" ]; then
-            rm -rf "${CHROOT_DIR}"
-            msg "已删除容器目录: ${CHROOT_DIR}"
+        if [ -n "${chroot_dir}" ] && [ -d "${chroot_dir}" ]; then
+            rm -rf "${chroot_dir}"
+            msg "已删除容器目录: ${chroot_dir}"
         fi
     else
         confirm_yes "确认删除该配置（容器目录数据保留）？" || { msg "已取消。"; return 1; }
@@ -911,8 +1047,10 @@ component_depends()
         # 组件必须存在
         conf_file="${INCLUDE_DIR}/${component}/deploy.conf"
         [ -e "${conf_file}" ] || continue
-        # 读取组件声明
-        eval $(grep -e '^TARGET=' -e '^DEPENDS=' "${conf_file}")
+        # 读取组件声明（参数化解析，不用 eval $(grep ...)：
+        # 组件配置文件若被篡改可执行任意命令）
+        TARGET=$(grep '^TARGET=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        DEPENDS=$(grep '^DEPENDS=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
         # 兼容性检查
         if [ "${WITHOUT_CHECK}" != "true" ]; then
             component_is_compatible ${TARGET} || continue
@@ -967,6 +1105,16 @@ component_exec()
             [ "${WITHOUT_CHECK}" != "true" ] && params_check ${PARAMS}
             # 执行动作
             [ "${DEBUG_MODE}" = "true" ] && msg "## ${COMPONENT} : ${DO_ACTION}"
+            # DO_ACTION 白名单校验：仅允许预定义组件动作（含部署复合动作）。
+            # 白名单之外的任何值一律拒绝，从机制上杜绝经 eval 执行任意代码。
+            case "${DO_ACTION}" in
+            'do_install && do_configure'|do_install|do_configure|do_start|do_stop|do_status|do_help)
+                ;;
+            *)
+                msg "[错误] 非法的组件动作: ${DO_ACTION}"
+                exit 1
+            ;;
+            esac
             set +e
             eval ${DO_ACTION} || exit 1
             set -e
@@ -992,7 +1140,8 @@ component_list()
     for component in $components
     do
         DESC=''
-        eval $(grep '^DESC=' "${INCLUDE_DIR}/${component}/deploy.conf")
+        # 参数化读取组件描述（不用 eval $(grep '^DESC=' ...)）
+        DESC=$(grep '^DESC=' "${INCLUDE_DIR}/${component}/deploy.conf" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
         output=$(printf "%-30s %.49s\n" "${component}" "${DESC}")
         msg "${output}"
     done
@@ -1090,10 +1239,12 @@ image_resize()
     fi
 
     # 调整前检查文件系统
+    local fsck_ok="false"
     msg -n "正在检查文件系统 ... "
     if command -v e2fsck >/dev/null 2>&1; then
         if e2fsck -fy "${TARGET_PATH}" >/dev/null 2>&1; then
             msg "完成"
+            fsck_ok="true"
         else
             msg "失败（文件系统异常，建议先手动修复）"
             return 1
@@ -1115,7 +1266,16 @@ image_resize()
         resize2fs "${TARGET_PATH}" "${new_mb}M" || { msg "失败"; return 1; }
         msg "完成"
     else
-        # 缩容：先缩小文件系统，再裁剪镜像文件
+        # 缩容：先缩小文件系统，再裁剪镜像文件。
+        # 缩容是高危操作：e2fsck 不可用时无法验证文件系统一致性，
+        # 一旦有未整理的数据分布在将被裁掉的区域，直接造成数据损坏——
+        # 此时明确拒绝执行，而不是带着风险继续。
+        if [ "${fsck_ok}" != "true" ]; then
+            msg "[错误] 未找到 e2fsck，无法在缩容前校验文件系统，已中止（避免数据损坏）"
+            msg "       请确认内置工具链完整（${TOOLS_DIR}）后重试。"
+            return 1
+        fi
+        msg "[警告] 缩容有数据丢失风险：请确认已备份，且文件系统刚通过 e2fsck -f 整理。"
         msg -n "正在缩小文件系统 ... "
         resize2fs "${TARGET_PATH}" "${new_mb}M" || { msg "失败"; return 1; }
         msg "完成"
@@ -2367,8 +2527,10 @@ deploy)
         container_mount || exit 1
     fi
 
-    # 构建期 statx 兼容层：编译并（容器已存在时）启用；部署结束自动清理
-    statx_shim_prepare
+    # 构建期 statx 兼容层：编译并（容器已存在时）启用；部署结束自动清理。
+    # 内核需要 shim 而编译失败时 fail-fast 退出（明确错误 + 解法），
+    # 不把问题拖到 debootstrap 阶段。
+    statx_shim_prepare || exit 1
     # 部署收尾：无论成败都清理构建期 shim；
     # 失败时顺带卸载组件残留的挂载，避免容器目录被占用、无法重建
     # 成功时默认自动卸载（可用 --keep-mounted 保留），状态干净、避免误操作
@@ -2498,6 +2660,8 @@ check)
         # do_check 输出经临时文件回读：POSIX sh 兼容（<<< 是 bash 扩展，
         # dash/部分 sh 下直接解析失败、静默退出 2）
         tmpfile="${TEMP_DIR}/check_json_$$.tmp"
+        # 先设兜底 trap 再写文件：中途异常退出（如 set -e 中断）也能清理
+        trap 'rm -f "${tmpfile}"' EXIT
         printf '%s\n' "${raw}" > "${tmpfile}"
         printf '{\n'
         printf '  "ok": %s,\n' "$([ ${rc} -eq 0 ] && echo true || echo false)"
@@ -2520,7 +2684,7 @@ check)
             ;;
             esac
         done < "${tmpfile}"
-        rm -f "${tmpfile}"
+        rm -f "${tmpfile}"  # 正常路径立即清理；兜底 trap 已在创建时设置
         printf '\n  ],\n'
         printf '  "fail": %d,\n  "warn": %d\n' "${fail}" "${warn}"
         printf '}\n'

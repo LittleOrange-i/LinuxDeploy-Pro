@@ -60,6 +60,10 @@ object ConfigStore {
 
     /** 写入配置（新建或编辑，全量覆盖；临时文件 + rename 原子写，中断不丢配置） */
     fun writeConfig(context: Context, cfg: ContainerConfig) {
+        // 名称校验：非法名（路径遍历/特殊字符）直接拒绝，不落到任何文件
+        if (!validConfigName(cfg.name)) {
+            throw IllegalArgumentException("非法配置名：${cfg.name}")
+        }
         val file = configFile(context, cfg.name)
         val sb = StringBuilder()
         sb.append("# ${file.name} ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date())}\n")
@@ -91,12 +95,27 @@ object ConfigStore {
         put(sb, "INIT", cfg.init)
         if (cfg.init == "sysv") put(sb, "INIT_LEVEL", cfg.initLevel)
         if (cfg.init == "run-parts") put(sb, "INIT_PATH", cfg.initPath)
-        // 原子写：先写 .tmp 再 rename。
-        val tmp = File(file.parentFile, "${file.name}.tmp")
-        tmp.writeText(sb.toString())
-        if (!tmp.renameTo(file)) {
-            file.writeText(sb.toString())
-            tmp.delete()
+        // 原子写：唯一 tmp 名（避免并发/残留 tmp 冲突）→ 写入并 fsync 落盘 →
+        // rename 原子替换（同目录即同文件系统，POSIX rename 语义）。
+        val tmp = File(file.parentFile, "${file.name}.tmp.${System.nanoTime()}")
+        try {
+            java.io.FileOutputStream(tmp).use { fos ->
+                fos.write(sb.toString().toByteArray())
+                fos.fd.sync() // 内容落盘后再 rename：掉电时不会出现 rename 生效但内容缺失
+            }
+            if (!tmp.renameTo(file)) {
+                // rename 失败（罕见，如目录被占用）：不直接覆盖原文件，
+                // 先备份再写——中途崩溃也不会丢配置
+                if (file.exists()) {
+                    file.copyTo(File(file.parentFile, "${file.name}.bak"), overwrite = true)
+                }
+                java.io.FileOutputStream(file).use { fos ->
+                    fos.write(sb.toString().toByteArray())
+                    fos.fd.sync()
+                }
+            }
+        } finally {
+            if (tmp.exists()) tmp.delete()
         }
         // 权限 644：owner 读写、组/其他只读（owner 为前端 app 自身，
         // 保证前端可读写；容器内/其他进程只读，不依赖 root 操作配置）
@@ -107,13 +126,29 @@ object ConfigStore {
 
     /** 删除配置文件 */
     fun deleteConfig(context: Context, name: String): Boolean {
+        if (!validConfigName(name)) return false
         val file = configFile(context, name)
         return file.exists() && file.delete()
     }
 
     /** 配置文件路径 */
-    private fun configFile(context: Context, name: String): File =
-        File(configDir(context), "$name.conf")
+    private fun configFile(context: Context, name: String): File {
+        // 名称双重校验：与 CLI config_file_of 的路径遍历防护对应。
+        // 非法名（含 /、..、路径分隔符等）映射到一个不存在的安全文件名，
+        // 读取/删除/存在性检查自然得到空结果，不会触达目录外文件。
+        if (!validConfigName(name)) {
+            return File(configDir(context), "__invalid__.conf")
+        }
+        return File(configDir(context), "$name.conf")
+    }
+
+    /**
+     * 配置名合法性：仅字母、数字、下划线、连字符（1-64 字符）。
+     * 拒绝路径遍历（../）、绝对路径与文件后缀注入，与 CLI config_create
+     * 的名称校验保持一致。
+     */
+    private fun validConfigName(name: String): Boolean =
+        name.isNotEmpty() && name.length <= 64 && name.matches(Regex("[A-Za-z0-9_-]{1,64}"))
 
     /** 写一行 KEY="value"（空值跳过，与 CLI params_write 一致） */
     private fun put(sb: StringBuilder, key: String, value: String) {

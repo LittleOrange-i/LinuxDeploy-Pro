@@ -36,11 +36,16 @@ object CliManager {
     const val CLI_VERSION = "4.0"
 
     /**
-     * 进程退出后等待输出读取线程收尾的时间（毫秒）。
+     * 进程退出后等待输出读取线程收尾的默认时间（毫秒）。
      * CLI 派生的守护进程可能继承 stdout 管道，读取端等不到 EOF；
-     * 主流程以进程退出为准，这里只给一个很短的窗口把已缓冲输出取完。
+     * 主流程以进程退出为准，这里给一个窗口把已缓冲输出取完。
+     * 默认 1500ms：500ms 对 debootstrap 等大量输出场景不足以搬完
+     * 内核管道缓冲（64KB+），会造成日志截断。
      */
-    private const val DRAIN_MS = 500L
+    private const val DRAIN_MS = 1500L
+
+    /** 高输出操作（部署/导入导出）的收尾窗口：debootstrap 输出可达数 MB */
+    private const val DRAIN_MS_LONG = 6000L
 
     /** 本次进程内是否已确认 root 可用（避免每次操作都反复探测） */
     @Volatile
@@ -134,14 +139,43 @@ object CliManager {
         copyDir(ASSET_ROOT, target)
         // assets 解压会丢失可执行位，这里统一补回：
         // 脚本、debootstrap、pkgdetails、tools 里的静态二进制都必须可执行，
-        // 否则部署时会出现 “Permission denied”（退出码 126）。
+        // 否则部署时会出现 "Permission denied"（退出码 126）。
+        var successCount = 0
+        var failCount = 0
+        // 必须可执行的关键文件（缺失执行位会直接阻断部署）
+        val criticalMissing = StringBuilder()
         target.walkTopDown().forEach { f ->
             if (f.isFile) {
-                f.setExecutable(true, false)
-                f.setReadable(true, false)
+                val critical = f.name.endsWith(".sh") ||
+                    f.name == "debootstrap" ||
+                    f.name == "pkgdetails" ||
+                    f.parentFile?.name == "tools"
+                try {
+                    f.setExecutable(true, false)
+                    f.setReadable(true, false)
+                    successCount++
+                } catch (e: IOException) {
+                    failCount++
+                    e.printStackTrace()
+                    if (critical) criticalMissing.append(f.absolutePath).append('\n')
+                }
             } else if (f.isDirectory) {
-                f.setExecutable(true, false)
+                try {
+                    f.setExecutable(true, false)
+                    successCount++
+                } catch (e: IOException) {
+                    failCount++
+                    e.printStackTrace()
+                }
             }
+        }
+        if (failCount > 0) {
+            android.util.Log.w("CliManager", "权限设置完成:${successCount}成功，${failCount}失败")
+        }
+        // 关键文件权限设置失败时不静默放过：否则要到部署阶段才以
+        // "Permission denied"（126）的形式暴露，用户无从排查
+        if (criticalMissing.isNotEmpty()) {
+            throw IOException("关键文件无法设置可执行权限:\n$criticalMissing")
         }
         // 保证基础目录存在（CLI 自己也会创建，这里兜底）
         File(target, "config").mkdirs()
@@ -206,6 +240,7 @@ object CliManager {
      * @param args      CLI 参数列表（如 ["--json", "config", "list"]）
      * @param onLine    输出行回调（默认忽略，用于日志实时回显）
      * @param input     写入进程标准输入的文本（如确认回答 "y\n"），写完后关闭
+     * @param drainMs   进程退出后等待读取线程收尾的毫秒数（高输出操作传 [DRAIN_MS_LONG]）
      * @return          退出码 + 完整输出；执行失败抛 [CliException]
      */
     fun runCli(
@@ -213,6 +248,7 @@ object CliManager {
         args: List<String>,
         onLine: (String) -> Unit = {},
         input: String? = null,
+        drainMs: Long = DRAIN_MS,
     ): CliResult {
         val dir = ensureExtracted(context)
             ?: throw CliException("CLI 未解压成功，请检查应用数据目录")
@@ -254,7 +290,7 @@ object CliManager {
             reader.isDaemon = true
             reader.start()
             val exit = process.waitFor()
-            reader.join(DRAIN_MS)
+            reader.join(drainMs)
             CliResult(exitCode = exit, output = synchronized(output) { output.toString() })
         } catch (e: IOException) {
             throw CliException("执行 CLI 失败：${e.message}")
@@ -320,10 +356,16 @@ object CliManager {
     private fun parseJson(output: String): JSONObject? {
         val start = output.indexOf('{')
         val end = output.lastIndexOf('}')
-        if (start < 0 || end <= start) return null
+        if (start < 0 || end <= start) {
+            // 输出中没有 JSON 对象：记录尾部片段，便于诊断 CLI 输出异常
+            android.util.Log.w("CliManager", "CLI 输出中未找到 JSON：${output.trim().takeLast(200)}")
+            return null
+        }
         return try {
             JSONObject(output.substring(start, end + 1))
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // 解析失败记录原因与片段（原实现完全静默，CLI 输出异常时无从排查）
+            android.util.Log.w("CliManager", "JSON 解析失败：${e.message}", e)
             null
         }
     }
@@ -391,11 +433,11 @@ object CliManager {
 
     /** 调整镜像大小（仅镜像安装有效） */
     fun resize(context: Context, name: String, size: String, onLine: (String) -> Unit = {}): Boolean =
-        runCli(context, listOf("-c", name, "resize", size), onLine).exitCode == 0
+        runCli(context, listOf("-c", name, "resize", size), onLine, drainMs = DRAIN_MS_LONG).exitCode == 0
 
     /** 部署容器（--yes 自动跳过确认，配合应用内确认流程） */
     fun deploy(context: Context, name: String, onLine: (String) -> Unit = {}): Boolean =
-        runCli(context, listOf("-c", name, "deploy", "--yes"), onLine).exitCode == 0
+        runCli(context, listOf("-c", name, "deploy", "--yes"), onLine, drainMs = DRAIN_MS_LONG).exitCode == 0
 
     /**
      * 检查部署目标目录是否非空（已部署/存在残留数据）。
@@ -445,7 +487,7 @@ object CliManager {
         outFile: File,
         onLine: (String) -> Unit = {},
     ): Boolean =
-        runCli(context, listOf("-c", name, "export", outFile.absolutePath), onLine).exitCode == 0
+        runCli(context, listOf("-c", name, "export", outFile.absolutePath), onLine, drainMs = DRAIN_MS_LONG).exitCode == 0
 
     /**
      * 导入 rootfs 归档。
@@ -457,7 +499,7 @@ object CliManager {
         archiveFile: File,
         onLine: (String) -> Unit = {},
     ): Boolean =
-        runCli(context, listOf("-c", name, "import", archiveFile.absolutePath), onLine).exitCode == 0
+        runCli(context, listOf("-c", name, "import", archiveFile.absolutePath), onLine, drainMs = DRAIN_MS_LONG).exitCode == 0
 
     /** 导入归档的应用私有暂存目录 */
     fun defaultImportDir(context: Context): File =
