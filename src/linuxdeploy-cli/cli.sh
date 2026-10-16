@@ -69,45 +69,33 @@ log_exec()
 {
     local rc_file rc
     rc_file=$(mktemp) || return 1
-    # 保存调用方已有的 EXIT trap（部署流程依赖 deploy_cleanup 兜底），
-    # 用完后原样恢复——直接 trap/覆盖会让部署失败时漏卸载残留挂载
-    local prev_trap=""
-    prev_trap=$(trap -p EXIT)
-    trap 'rm -f "${rc_file}"' EXIT
+    # 在子 shell 内设置 EXIT trap 清理临时文件：子 shell 的 trap 仅作用于自身，
+    # 不会覆盖调用方（部署流程的 deploy_cleanup 等）已注册的 EXIT trap，
+    # 避免部署失败时漏卸载残留挂载。
     (
-        "$@" 2>&1
-        echo $? > "${rc_file}"
-    ) | log_stream
-    rc=$(cat "${rc_file}" 2>/dev/null)
-    rm -f "${rc_file}"
-    # 恢复调用方原有 EXIT trap（无则清除）
-    if [ -n "${prev_trap}" ]; then
-        eval "${prev_trap}"
-    else
-        trap - EXIT
-    fi
-    [ -n "${rc}" ] || rc=${PIPESTATUS[0]:-0}
-    return ${rc}
+        trap 'rm -f "${rc_file}"' EXIT
+        (
+            "$@" 2>&1
+            echo $? > "${rc_file}"
+        ) | log_stream
+        rc=$(cat "${rc_file}" 2>/dev/null)
+        rm -f "${rc_file}"
+        [ -n "${rc}" ] || rc=0
+        return ${rc}
+    )
 }
 
-# 安全变量赋值（替代 eval ${key}="${val}"，杜绝值中的命令注入）
-# 后端选择（探测一次，全程复用）：
-#   declare —— bash：declare -g 直接赋值，无二次解析
-#   nameref —— mksh（Android /system/bin/sh）：别名赋值，无二次解析
-#   evalesc —— 两者都没有的老 shell：转义全部元字符后用 eval，等价字面赋值
-# 三种后端都不会执行值中的 $()、反引号、引号、分号。
-# 入参：$1 变量名（调用方须已校验 ^[0-9A-Z_]{1,32}$），$2 值
+# 安全变量赋值（替代 eval 直接赋值，杜绝值中的命令注入）
+# 本项目运行环境只有两种 shell，分别采用无二次解析的赋值方式：
+#   bash 用 declare 直接赋值；mksh 用 nameref 别名赋值
+#   两者都不会执行值中的变量引用、反引号、引号、分号。
+# 入参：1 为变量名（调用方须已校验仅含大写字母数字下划线），2 为值
 ld_set_var()
 {
-    case "${LD_VAR_BACKEND:-declare}" in
-    nameref)
+    case "${LD_VAR_BACKEND:-bash}" in
+    mksh)
         nameref ld_ref="$1" 2>/dev/null
         ld_ref="$2"
-    ;;
-    evalesc)
-        local esc
-        esc=$(printf '%s' "$2" | sed 's/\([\\$`"]\)/\\\1/g')
-        eval "$1=\"${esc}\""
     ;;
     *)
         declare -g "$1=$2" 2>/dev/null
@@ -115,17 +103,13 @@ ld_set_var()
     esac
 }
 
-# 安全读取变量值（替代 eval "val=\$${key}" 间接展开），值输出到 stdout
+# 安全读取变量值（替代 eval 间接展开），值输出到 stdout
 ld_get_var()
 {
-    case "${LD_VAR_BACKEND:-declare}" in
-    nameref)
+    case "${LD_VAR_BACKEND:-bash}" in
+    mksh)
         nameref ld_ref="$1" 2>/dev/null
         printf '%s' "${ld_ref:-}"
-    ;;
-    evalesc)
-        # 键名已限定 [0-9A-Z_]{1,32}，无注入面
-        eval "printf '%s' \"\${$1:-}\""
     ;;
     *)
         declare -n ld_ref="$1" 2>/dev/null
@@ -134,13 +118,13 @@ ld_get_var()
     esac
 }
 
-# shell 能力探测（仅执行一次）：决定 ld_set_var/ld_get_var 的后端
+# shell 后端探测（仅执行一次）：bash 走 declare，其余按 mksh 处理。
+# 说明：Android 的 /system/bin/sh 即 mksh，minSdk 28 起均支持 nameref。
+# nameref 是 mksh 保留字，只能在函数内使用，且不得作为 case 标签，否则解析报错。
 if [ -n "${BASH_VERSION:-}" ]; then
-    LD_VAR_BACKEND="declare"
-elif nameref _ld_probe=LD_PROBE_TARGET 2>/dev/null; then
-    LD_VAR_BACKEND="nameref"
+    LD_VAR_BACKEND="bash"
 else
-    LD_VAR_BACKEND="evalesc"
+    LD_VAR_BACKEND="mksh"
 fi
 
 # JSON 字符串转义（--json 模式输出安全字段）
@@ -450,6 +434,20 @@ kernel_need_statx_shim()
 statx_shim_ensure_compiled()
 {
     [ -n "${STATX_SHIM_SO}" ] && [ -f "${STATX_SHIM_SO}" ] && return 0
+    # 预编译兜底 1：构建机无 gcc 时，可直接把 statx_shim.so 放进 TEMP_DIR
+    # （对应编译失败时的错误提示；此前该逃生通道未实现，放入不会被采纳）
+    if [ -f "${TEMP_DIR}/statx_shim.so" ]; then
+        STATX_SHIM_SO="${TEMP_DIR}/statx_shim.so"
+        return 0
+    fi
+    # 预编译兜底 2：随 assets 分发的 glibc/arm64 预编译产物，无 gcc 环境开箱即用
+    if [ -f "${ENV_DIR}/statx_shim.so" ]; then
+        cp -f "${ENV_DIR}/statx_shim.so" "${TEMP_DIR}/statx_shim.so" 2>/dev/null || true
+        if [ -f "${TEMP_DIR}/statx_shim.so" ]; then
+            STATX_SHIM_SO="${TEMP_DIR}/statx_shim.so"
+            return 0
+        fi
+    fi
     local src="${ENV_DIR}/statx_shim.c"
     if [ ! -f "${src}" ]; then
         msg "[跳过] 缺少 statx 兼容层源码: ${src}"
@@ -849,7 +847,7 @@ config_create()
     SSH_PORT="${SSH_PORT:-22}"
     GRAPHICS="${GRAPHICS:-}"
     # 安装方式：directory（目录）/ file（镜像文件）/ ram / partition。
-    # 前端“镜像安装”映射为 file；FS_TYPE 默认 ext4（与前端“ext4 镜像”文案一致）。
+    # 前端"镜像安装"映射为 file；FS_TYPE 默认 ext4（与前端"ext4 镜像"文案一致）。
     TARGET_TYPE="${TARGET_TYPE:-directory}"
     DISK_SIZE="${DISK_SIZE:-}"
     FS_TYPE="${FS_TYPE:-ext4}"
@@ -1257,7 +1255,7 @@ image_resize()
         msg "跳过（未找到 e2fsck）"
     fi
 
-    # resize2fs 裸数字按“块”解释，统一换算成 MB 后缀，避免歧义
+    # resize2fs 裸数字按"块"解释，统一换算成 MB 后缀，避免歧义
     new_mb=$(( new_bytes / 1048576 ))
     [ "${new_mb}" -gt 0 ] || { msg "新大小过小（至少 1M）"; return 1; }
 
@@ -1602,7 +1600,7 @@ container_stop()
 
 # 重启容器：停止 → 等待 3 秒 → 启动。
 # 用途：容器内 reboot 接管脚本（经 unchroot 在宿主侧调用）与手动 cli.sh restart。
-# 设计（2026-09 讨论后定案）：直接复用既有的 stop / start 全流程，不自研“清进程重拉”半套逻辑。
+# 设计（2026-09 讨论后定案）：直接复用既有的 stop / start 全流程，不自研"清进程重拉"半套逻辑。
 # 原因是 mount namespace 的生存规则因设备而异：
 #   - k30p 这类是全局挂载：容器挂载在全局 ns 里，清进程不会掉挂载；
 #   - 另一类是独立（每会话）命名空间：容器内进程一旦清空，ns 即被回收，挂载随之消失，
@@ -2378,7 +2376,7 @@ fi
 METHOD="chroot"
 
 # 初始化系统兜底：旧配置可能无 INIT 键，统一默认 sysv（Debian 系 /etc/rcN.d 布局）；
-# INCLUDE 含 init 组件时组件依赖解析依赖 INIT 值，缺省会直接报“缺少必要参数”。
+# INCLUDE 含 init 组件时组件依赖解析依赖 INIT 值，缺省会直接报"缺少必要参数"。
 INIT="${INIT:-sysv}"
 INIT_LEVEL="${INIT_LEVEL:-3}"
 
@@ -2390,8 +2388,10 @@ if [ "${JSON_MODE}" != "true" ]; then
     msg "=========================================="
 fi
 
-# 解析命令
-OPTCMD="$1"; shift
+# 解析命令（无参数时 helper 会给出用法；shift 前须确认有参数可移，
+# 否则 mksh 对特殊内建 shift 的错误会直接终止脚本且 stderr 已被丢弃）
+OPTCMD="${1:-}"
+[ $# -gt 0 ] && shift
 case "${OPTCMD}" in
 
 config)
@@ -2565,7 +2565,7 @@ deploy)
 
     # 执行安装与配置。
     # 显式把 bootstrap 放在最前：bootstrap 依赖 core，组件拓扑排序会
-    # 自动先跑 core 再跑 bootstrap，避免“core 配置先于容器部署”的顺序错误。
+    # 自动先跑 core 再跑 bootstrap，避免"core 配置先于容器部署"的顺序错误。
     component_exec bootstrap ${INCLUDE:-core}
     exit $?
 ;;

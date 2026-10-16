@@ -29,8 +29,10 @@ object CliManager {
     /** assets 里的 CLI 目录名 */
     private const val ASSET_ROOT = "linuxdeploy-cli"
 
-    /** 解压标记：改动此值可强制重新解压（升级 CLI 时用） */
-    private const val EXTRACT_MARKER = "4.1.19"
+    /** 解压标记：改动此值可强制重新解压（升级 CLI 时用）。
+     * 4.1.19-r2：解压时增加 BOM/CRLF 规范化，强制覆盖设备上被污染的旧脚本
+     * 4.1.19-r3：CLI 参数重建修复 + statx_shim 预编译产物随 assets 分发 */
+    private const val EXTRACT_MARKER = "4.1.19-r3"
 
     /** CLI 版本（与 cli.sh 内 VERSION 对应，仅用于日志显示） */
     const val CLI_VERSION = "4.0"
@@ -131,7 +133,7 @@ object CliManager {
                     copyDir(childPath, childDest)
                 } else {
                     context.assets.open(childPath).use { input ->
-                        childDest.outputStream().use { output -> input.copyTo(output) }
+                        childDest.writeBytes(normalizeForPosix(input.readBytes()))
                     }
                 }
             }
@@ -180,6 +182,39 @@ object CliManager {
         // 保证基础目录存在（CLI 自己也会创建，这里兜底）
         File(target, "config").mkdirs()
         File(target, "tmp").mkdirs()
+    }
+
+    /**
+     * POSIX 文本规范化：剥 UTF-8 BOM，CRLF / 孤立 CR 统一为 LF。
+     *
+     * 背景：Windows 构建机的 core.autocrlf 或编辑器可能把 CRLF、BOM 带进
+     * assets。mksh 会把行尾 \r 当作命令名/词法符号的一部分，表现为
+     * "inaccessible or not found"、"syntax error: unexpected 'in'"。
+     * 含 NUL 字节的文件视为二进制（debootstrap、pkgdetails、tools 目录内文件），原样保留。
+     */
+    private fun normalizeForPosix(bytes: ByteArray): ByteArray {
+        if (bytes.isEmpty() || bytes.contains(0.toByte())) return bytes
+        var i = 0
+        if (bytes.size >= 3 &&
+            bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()
+        ) {
+            i = 3
+        }
+        val out = ByteArray(bytes.size - i)
+        var j = 0
+        while (i < bytes.size) {
+            val b = bytes[i]
+            if (b == '\r'.code.toByte()) {
+                // CRLF 只留 \n；孤立 CR 同样归一为 \n
+                if (i + 1 < bytes.size && bytes[i + 1] == '\n'.code.toByte()) i++
+                out[j] = '\n'.code.toByte()
+            } else {
+                out[j] = b
+            }
+            i++
+            j++
+        }
+        return if (j == out.size) out else out.copyOf(j)
     }
 
     /** 重新部署运行环境：强制重新解压 CLI（设置页“重装运行环境”用） */

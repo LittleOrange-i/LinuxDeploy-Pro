@@ -1,0 +1,19 @@
+# 统一换行符：任何平台检出的文本文件一律 LF。
+# 背景：Windows core.autocrlf=true 会把 CRLF 打包进 APK assets，
+# mksh 把行尾 \r 当作命令名/词法符号的一部分，导致 cli.sh 在设备上报
+# "inaccessible or not found" / "syntax error: unexpected 'in'"。
+* text=auto eol=lf
+
+# Windows 批处理必须保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件明确豁免，禁止任何换行转换（防误判）
+*.tgz binary
+*.png binary
+*.jpg binary
+*.webp binary
+*.jar binary
+debootstrap binary
+pkgdetails binary
+**/tools/* binary
