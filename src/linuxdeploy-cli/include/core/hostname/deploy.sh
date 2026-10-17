@@ -5,11 +5,11 @@
 do_install()
 {
     msg ":: 正在安装 ${COMPONENT} ... "
-    # 部署时 core/* 先于 bootstrap 执行（core 依赖 bootstrap 是为了让 core
-    # 排在 rootfs 安装之后，但首次部署计划里 core 子项仍可能先于引导组件被
-    # 遍历到），此时容器内还没有可用的包管理器，chroot/apt 会直接卡死。
+    # 兜底保护：正常部署时本组件已在 bootstrap 之后执行（见 cli.sh deploy 分支
+    # 的两段式执行），但若通过 component_exec 单独调用而 rootfs 尚未安装，
+    # 此时容器内没有包管理器，chroot/apt 会直接卡死。
     # 引导阶段已把 hostname 打包进基础系统（见 bootstrap/*/deploy.sh 的
-    # BASE_INCLUDE_PACKAGES），这里仅在容器已具备包管理器时兜底补装。
+    # BASE_INCLUDE_PACKAGES），仅在容器已可用时兜底补装。
     if [ ! -x "${CHROOT_DIR}/bin/sh" ] && [ ! -x "${CHROOT_DIR}/usr/bin/sh" ]; then
         msg "容器系统尚未安装，跳过（hostname 随引导组件一并安装）"
         return 0
