@@ -5,6 +5,15 @@
 do_install()
 {
     msg ":: 正在安装 ${COMPONENT} ... "
+    # 兜底保护：正常部署时本组件已在 bootstrap 之后执行（见 cli.sh deploy 分支
+    # 的两段式执行），但若通过 component_exec 单独调用而 rootfs 尚未安装，
+    # 此时容器内没有包管理器，chroot/apt 会直接卡死。
+    # 引导阶段已把 hostname 打包进基础系统（见 bootstrap/*/deploy.sh 的
+    # BASE_INCLUDE_PACKAGES），仅在容器已可用时兜底补装。
+    if [ ! -x "${CHROOT_DIR}/bin/sh" ] && [ ! -x "${CHROOT_DIR}/usr/bin/sh" ]; then
+        msg "容器系统尚未安装，跳过（hostname 随引导组件一并安装）"
+        return 0
+    fi
     local packages=""
     case "${DISTRIB}:${ARCH}:${SUITE}" in
     debian:*|ubuntu:*|kali:*)
