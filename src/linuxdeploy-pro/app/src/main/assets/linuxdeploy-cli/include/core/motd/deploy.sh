@@ -8,7 +8,11 @@ do_configure()
     local linux_version="GNU/Linux"
     if [ -f "${CHROOT_DIR}/etc/os-release" ]
     then
-        linux_version=$(. "${CHROOT_DIR}/etc/os-release"; echo ${PRETTY_NAME})
+        # 参数化读取 PRETTY_NAME，不 source 容器内文件（内容外部可控，
+        # source 会执行其中任意 shell 代码）；与 cli.sh 的读取方式保持一致
+        linux_version=$(grep '^PRETTY_NAME=' "${CHROOT_DIR}/etc/os-release" | head -1 \
+            | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        [ -n "${linux_version}" ] || linux_version="GNU/Linux"
     elif [ -f "${CHROOT_DIR}/etc/gentoo-release" ]
     then
         linux_version=$(cat "${CHROOT_DIR}/etc/gentoo-release")

@@ -266,16 +266,37 @@ loop_support()
     [ -e "/dev/loop-control" ] || [ -e "/dev/loop0" ]
 }
 
-# 获取指定用户的 home 目录
-user_home()
+# 在容器 /etc/passwd 中按用户名取字段（$1=用户名 $2=字段号）
+# 注意：必须读容器内 passwd——宿主（Android）没有 getent，原实现
+# `getent passwd` 在宿主上恒为空，导致 profile 组件的 chown 目标变成空字符串，
+# 所有发行版都会踩到（不只是 Alpine）。
+user_field()
 {
-    getent passwd "$1" 2>/dev/null | cut -d: -f6
+    local user="$1" field="${2:-6}" passwd
+    [ -n "${user}" ] || user="root"
+    passwd="${CHROOT_DIR}/etc/passwd"
+    if [ -r "${passwd}" ]; then
+        awk -F: -v u="${user}" -v f="${field}" '$1==u {print $f; exit}' "${passwd}"
+    fi
 }
 
-# 获取指定用户的登录 shell
+# 获取指定用户的 home 目录（容器内路径）
+user_home()
+{
+    local home
+    home=$(user_field "$1" 6)
+    # 容器内无该用户时按约定回退（root 必为 /root）
+    [ -n "${home}" ] || home="/root"
+    echo "${home}"
+}
+
+# 获取指定用户的登录 shell（容器内路径）
 user_shell()
 {
-    getent passwd "$1" 2>/dev/null | cut -d: -f7
+    local shell
+    shell=$(user_field "$1" 7)
+    [ -n "${shell}" ] || shell="/bin/sh"
+    echo "${shell}"
 }
 
 # 判断路径是否已挂载

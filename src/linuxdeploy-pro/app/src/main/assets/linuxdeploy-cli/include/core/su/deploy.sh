@@ -15,5 +15,7 @@ do_configure()
             fi
         fi
     done
+    # Alpine（BusyBox su / util-linux su，均无 PAM）：root 切换本身不受限制，
+    # 无对应配置文件可改，直接跳过即可，不必报错。
     return 0
 }

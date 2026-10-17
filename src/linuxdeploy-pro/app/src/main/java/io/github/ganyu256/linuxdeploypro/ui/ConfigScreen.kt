@@ -93,6 +93,7 @@ private val DISTRO_MIRRORS = mapOf(
     "kali" to "http://mirrors.ustc.edu.cn/kali/",
     "alpine" to "http://mirrors.tuna.tsinghua.edu.cn/alpine/",
     "archlinux" to "http://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/",
+    "slackware" to "http://mirrors.ustc.edu.cn/slackware/",
     "rootfs" to "",
 )
 
@@ -532,10 +533,11 @@ fun ConfigScreen(
                 ),
             ) {
                 Column {
-                    // systemctl（init 模式）依赖 python3 + systemd 风格 unit，
-                    // Debian 系（debian/ubuntu/kali）与 CentOS/Fedora 均自带；
-                    // Alpine 用 OpenRC、Arch 不保证 python3，只保留 SysV/run-parts
-                    val systemctlCapable = distro in listOf("debian", "ubuntu", "kali", "centos", "fedora")
+                    // systemctl（init 模式）依赖 python3 + systemd 风格 unit：
+                    // Debian 系（debian/ubuntu/kali）自带 python3；CentOS 组件已废弃、
+                    // 界面不提供该发行版。Alpine 用 OpenRC，Arch/Slackware 不保证
+                    // systemd unit 与 python3，因此这些发行版只保留 SysV/run-parts。
+                    val systemctlCapable = distro in listOf("debian", "ubuntu", "kali")
                     val openrcCapable = distro == "alpine"
                     val initItems = mutableListOf("SysV（/etc/rcN.d）", "run-parts（自定义目录）")
                     val initValues = mutableListOf("sysv", "run-parts")

@@ -63,7 +63,13 @@ do_install()
     is_ok "失败" "完成"
 
     msg "正在安装软件包: "
-    apk_install shadow sudo tzdata ${EXTRA_PACKAGES}
+    # 通用性：与 Debian 系对齐，补齐各组件会用到的常见工具。
+    # - shadow：提供 useradd/chpasswd（core/profile、core/aid 依赖）
+    # - sudo / tzdata：权限与时区（core/sudo、core/timezone）
+    # - bash：脚本与交互默认 shell（ldstatus、终端优先使用）
+    # - curl、wget、ca-certificates：包下载与 https 校验（各组件/用户常用）
+    # - openssh-client：容器内可主动 ssh 出去（部分组件与用户习惯依赖）
+    apk_install shadow sudo tzdata bash curl wget ca-certificates openssh-client ${EXTRA_PACKAGES}
     is_ok || return 1
 
     return 0

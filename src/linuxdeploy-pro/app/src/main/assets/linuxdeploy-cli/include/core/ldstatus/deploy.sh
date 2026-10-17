@@ -9,11 +9,23 @@ do_install()
 {
     msg ":: 正在安装 ${COMPONENT} ... "
     mkdir -p "${CHROOT_DIR}/run/ldstatus" "${CHROOT_DIR}/usr/local/sbin"
-    cat > "${CHROOT_DIR}/usr/local/sbin/ldstatus" <<'EOF'
-#!/bin/bash
+    # 容器内可能没有 bash（Alpine 只有 ash，部分 Arch 精简版也只有 sh）：
+    # 安装时探测一次并把解释器写死进脚本，避免启动阶段因缺 bash 而静默失败。
+    local sh_bin="/bin/sh"
+    if [ -x "${CHROOT_DIR}/bin/bash" ] || [ -x "${CHROOT_DIR}/usr/bin/bash" ]; then
+        if [ -x "${CHROOT_DIR}/bin/bash" ]; then
+            sh_bin="/bin/bash"
+        else
+            sh_bin="/usr/bin/bash"
+        fi
+    fi
+    # exec -a 改进程名是 bash/部分 mksh 的特性；ash 不支持时退回普通后台进程，
+    # 宿主的 ldstatus_running 校验只看 cmdline 是否含 ldstatus，这里显式拼接名字。
+    cat > "${CHROOT_DIR}/usr/local/sbin/ldstatus" <<EOF
+#!${sh_bin}
 /bin/mkdir -p /run/ldstatus
 # 新会话完全脱离宿主（setsid），后台写 pid 后 exec 成 ldstatus 常驻
-/bin/setsid /bin/bash -c 'echo $$ > /run/ldstatus/pid; exec -a ldstatus /bin/sleep infinity' </dev/null >/dev/null 2>&1 &
+/bin/setsid ${sh_bin} -c 'echo \$\$ > /run/ldstatus/pid; exec -a ldstatus /bin/sleep infinity' </dev/null >/dev/null 2>&1 &
 exit 0
 EOF
     chmod 755 "${CHROOT_DIR}/usr/local/sbin/ldstatus"
@@ -28,12 +40,26 @@ do_start()
     fi
     msg -n ":: 启动 ${COMPONENT} ... "
     # 预检容器内执行环境：缺文件时给出大白话原因。最常见根因是 rootfs
-    # 解压不完整（部署日志中"未检测到 glibc"即同类信号），缺 bash/setsid/sleep
+    # 解压不完整（部署日志中"未检测到 glibc"即同类信号），缺 setsid/sleep
     # 会让本组件静默失败，提前拦截避免用户只看到一句"失败"无从下手。
     local missing=""
     local f
-    for f in /usr/local/sbin/ldstatus /bin/bash /bin/setsid /bin/sleep; do
-        [ -e "${CHROOT_DIR}${f}" ] || missing="${missing} ${f}"
+    # shell：bash 优先，缺失时用 sh（Alpine/精简 Arch 没有 bash）
+    local have_shell=""
+    for f in /bin/bash /usr/bin/bash /bin/sh /usr/bin/sh /bin/ash /usr/bin/ash; do
+        [ -e "${CHROOT_DIR}${f}" ] && have_shell="yes" && break
+    done
+    [ -n "${have_shell}" ] || missing="${missing} /bin/sh"
+    # setsid/sleep：busybox 环境可能只有 applet 没有独立文件，此时按 busybox 兜底
+    for f in /usr/local/sbin/ldstatus /bin/setsid /bin/sleep; do
+        if [ ! -e "${CHROOT_DIR}${f}" ]; then
+            # busybox 的 applet 链接在 /usr/bin 或 /bin 下，两种都认
+            local base="${f##*/}"
+            if [ -e "${CHROOT_DIR}/bin/busybox" ] && [ "${base}" != "ldstatus" ]; then
+                continue
+            fi
+            missing="${missing} ${f}"
+        fi
     done
     if [ -n "${missing}" ]; then
         msg "失败"

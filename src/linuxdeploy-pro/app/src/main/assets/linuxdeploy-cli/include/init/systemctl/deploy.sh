@@ -25,6 +25,35 @@ systemctl_running()
     tr '\0' ' ' < "/proc/${s_pid}/cmdline" | grep -q systemctl
 }
 
+# 容器内 python3 是否可用（systemctl.py 的运行依赖）
+systemctl_python_ready()
+{
+    [ -x "${CHROOT_DIR}/usr/bin/python3" ] || [ -x "${CHROOT_DIR}/usr/bin/python3.10" ] \
+        || [ -x "${CHROOT_DIR}/usr/bin/python3.9" ] || [ -x "${CHROOT_DIR}/usr/bin/python3.11" ] \
+        || [ -x "${CHROOT_DIR}/usr/bin/python3.12" ]
+}
+
+# 按发行版安装 python3。Debian 系/Ubuntu/Kali 的 bootstrap 已自带 python3；
+# CentOS/Fedora/Arch 等默认不带，必须在部署时补装，否则 systemctl.py 无法运行
+# （表现为 init 起不来、sshd 永不启动）。
+systemctl_ensure_python()
+{
+    systemctl_python_ready && return 0
+    msg -n ":: 安装 python3（systemctl 运行依赖） ... "
+    local ok=1
+    case "${DISTRIB}" in
+    debian|ubuntu|kali)     apt_install python3 && ok=0 ;;
+    centos)                 yum_install python3 && ok=0 ;;
+    fedora)                 dnf_install python3 && ok=0 ;;
+    archlinux)              pacman_install python && ok=0 ;;
+    alpine)                 apk_install python3 && ok=0 ;;
+    slackware)              slackpkg_install python3 && ok=0 ;;
+    esac
+    systemctl_python_ready && ok=0
+    [ ${ok} -eq 0 ] && msg "完成" || msg "失败"
+    return ${ok}
+}
+
 do_install()
 {
     msg ":: 正在安装 ${COMPONENT} ... "
@@ -43,6 +72,8 @@ do_install()
         msg "[错误] 缺少打包的 systemctl.py: ${src}"
         return 1
     fi
+    # python3 缺失时补装（失败不阻断部署，启动阶段会再次提示）
+    systemctl_ensure_python || msg "[警告] python3 未能安装，systemctl 模式将无法启动（可改用 sysv）"
     return 0
 }
 
@@ -54,6 +85,12 @@ do_start()
     fi
     msg -n ":: 启动 ${COMPONENT} ... "
     [ -x "${CHROOT_DIR}/usr/bin/systemctl" ] || { msg "失败（/usr/bin/systemctl 未安装，请重新部署）"; return 1; }
+    # python3 是 systemctl.py 的运行依赖：缺失时给出可执行的原因，而不是让 init 静默失败
+    if ! systemctl_ensure_python >/dev/null 2>&1 || ! systemctl_python_ready; then
+        msg "失败（容器内缺少 python3，systemctl 模式无法运行）"
+        msg "[提示] 可改用「SysV」初始化系统，或进入终端执行包管理器安装 python3 后重试。"
+        return 1
+    fi
     # 二进制刷新：容器内的 /usr/bin/systemctl 与打包脚本不一致（或不是 python 脚本，
     # 例如发行版自带的 ELF systemctl / 损坏文件）时覆盖为打包版本。
     # 目的：init 用的一定是本项目的 systemctl.py，APK 更新后"重启容器"即可生效。

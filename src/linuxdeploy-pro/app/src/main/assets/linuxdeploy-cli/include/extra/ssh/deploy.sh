@@ -72,7 +72,9 @@ do_install()
         slackpkg_install ${packages}
     ;;
     alpine:*)
-        packages="openssh-server"
+        # Alpine 的 openssh-server 不自带 host key 与 /etc/ssh 目录结构，
+        # 用 openssh（sshd 本体）更稳妥
+        packages="openssh"
         apk_install ${packages}
     ;;
     esac
@@ -82,8 +84,18 @@ do_configure()
 {
     msg ":: 正在配置 ${COMPONENT} ... "
     ssh_config_apply
-    # 注：ssh.service 的 enable 由 init/systemctl 组件在 start 拉起 --init 前统一执行，
-    # 此处不再调用 python systemctl（部署期调用曾导致进程异常终止）。
+    # Alpine：OpenRC 的 sshd 服务默认不随 runlevel 启动，部署时 enable；
+    # 交由 init/openrc 在容器启动时按 runlevels 拉起（不在此处直接起进程）。
+    case "${DISTRIB}" in
+    alpine)
+        if [ -x "${CHROOT_DIR}/etc/init.d/sshd" ]; then
+            chroot_exec -u root rc-update add sshd default >/dev/null 2>&1 || true
+            msg ":: 已将 sshd 加入 OpenRC default runlevel"
+        fi
+    ;;
+    esac
+    # 注：systemctl 模式下 ssh.service 的 enable 由 init/systemctl 组件在 start
+    # 拉起 --init 前统一执行，此处不再调用 python systemctl。
     return 0
 }
 
@@ -97,10 +109,18 @@ do_start()
         msg "跳过（systemctl 模式：ssh 由 systemctl 管理，端口 ${SSH_PORT} 已写入 sshd_config）"
         return 0
     fi
-    # 已由 init（sysv/run-parts）拉起的 sshd 不重复启动
+    # 已由 init（sysv/run-parts/openrc）拉起的 sshd 不重复启动
     if sshd_running; then
         msg "跳过（sshd 已在运行）"
         return 0
+    fi
+    # OpenRC 容器：交给 rc-service 启动（能正确管理 pid 与依赖），不直接裸起 sshd
+    if [ "${INIT}" = "openrc" ] && [ -x "${CHROOT_DIR}/etc/init.d/sshd" ]; then
+        chroot_exec -u root rc-service sshd start >/dev/null 2>&1 || true
+        if sshd_running; then
+            msg "完成（OpenRC 已启动 sshd）"
+            return 0
+        fi
     fi
     make_dirs /run/sshd /var/run/sshd
     local sshd
