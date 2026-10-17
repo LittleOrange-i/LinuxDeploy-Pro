@@ -77,6 +77,108 @@ do_install()
     return 0
 }
 
+# 容器运行环境适配（幂等，内容不变时不重写、不产生额外日志）
+# 背景：安卓 chroot 里 PID 1 不是 systemd，发行版打包的 docker / containerd 单元
+# 依赖真 systemd 的 socket 激活与 sd_notify，直接 `systemctl start docker` 会失败
+# （最显眼的报错只是 systemctl.py 对 ExecReload=/bin/kill 的 WARNING，并非根因）。
+# 这里只在已安装 docker/containerd 时写入 drop-in 与运行时配置：
+#   1) docker.service：Type=simple、去掉 docker.socket 依赖与 -H fd://、
+#      ExecReload 置空（消除 /bin/kill 告警，reload 退化为 restart）、
+#      默认 vfs 存储 + 关闭 iptables/桥接（安卓常无完整 netfilter）；
+#   2) containerd：SystemdCgroup=false（无 systemd 时不能用 systemd cgroup 驱动）。
+# 未安装 docker 的容器不会被创建任何相关文件。
+container_runtime_tune()
+{
+    local d
+    # --- docker.service drop-in ---
+    for d in "${CHROOT_DIR}/usr/lib/systemd/system" "${CHROOT_DIR}/lib/systemd/system"; do
+        [ -e "${d}/docker.service" ] || continue
+        make_dirs "${CHROOT_DIR}/etc/systemd/system/docker.service.d"
+        local conf="${CHROOT_DIR}/etc/systemd/system/docker.service.d/container.conf"
+        # 已存在时只在内容不同（如旧版本写入）时覆盖，保持幂等
+        if [ ! -e "${conf}" ] || ! grep -q 'Type=simple' "${conf}" 2>/dev/null; then
+            cat > "${conf}" <<CONTAINERCONF
+# linuxdeploy: container runtime
+[Unit]
+# 无真实 systemd：去掉 socket 激活依赖，避免 docker.socket 缺失导致启动失败
+Requires=
+After=network-online.target
+
+[Service]
+# 不等待 sd_notify 的 READY（Type=notify 在容器内不可靠）
+Type=simple
+# 不使用 -H fd://（fd 传递由 systemd 提供），改为 unix socket
+ExecStart=
+ExecStart=/usr/sbin/dockerd -H unix:///var/run/docker.sock --iptables=false --ip6tables=false --bridge=none --storage-driver=vfs --userland-proxy-path=/usr/bin/docker-proxy
+# 置空以消除 systemctl.py 对 /bin/kill 的告警；reload 时自动退化为 restart
+ExecReload=
+Restart=on-failure
+RestartSec=3s
+CONTAINERCONF
+        fi
+        break
+    done
+    # --- containerd：关闭 systemd cgroup 驱动 ---
+    d="${CHROOT_DIR}/etc/containerd"
+    if [ -e "${CHROOT_DIR}/usr/bin/containerd" ] || [ -e "${CHROOT_DIR}/usr/sbin/containerd" ]; then
+        make_dirs "${d}"
+        if [ ! -e "${d}/config.toml" ]; then
+            cat > "${d}/config.toml" <<CONTAINERD
+version = 2
+# 无 systemd：runc 使用 cgroupfs 驱动（否则 containerd 会尝试向 systemd 申请 cgroup）
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = false
+CONTAINERD
+        elif ! grep -q 'SystemdCgroup' "${d}/config.toml" 2>/dev/null; then
+            # 已有用户配置：只追加标记注释，不改动用户内容（避免破坏自定义配置）
+            { echo ""; echo "# linuxdeploy: container runtime（无 systemd 时请确保 SystemdCgroup=false）"; } >> "${d}/config.toml"
+        fi
+    fi
+    # --- docker daemon 侧：存储驱动兜底（安卓内核多用不了 overlay2） ---
+    if [ -e "${CHROOT_DIR}/usr/bin/dockerd" ] || [ -e "${CHROOT_DIR}/usr/sbin/dockerd" ]; then
+        make_dirs "${CHROOT_DIR}/etc/docker"
+        if [ ! -e "${CHROOT_DIR}/etc/docker/daemon.json" ]; then
+            cat > "${CHROOT_DIR}/etc/docker/daemon.json" <<DOCKERJSON
+{
+  "storage-driver": "vfs"
+}
+DOCKERJSON
+        fi
+    fi
+    return 0
+}
+
+# 检查 Docker 所需的安卓内核条件，不满足时给出可读提示（只提示，不阻断容器启动）
+# 真机实测（M2102K1AC / Android 11）：ROM 只挂了 blkio/cpu/cpuacct/cpuset/freezer/memory，
+# 缺少 devices 与 pids 控制器，dockerd 启动必然报 "Devices cgroup isn't mounted"，
+# 这不是容器配置问题，只能换内核/ROM。提前说明可避免用户反复重装排查。
+container_runtime_check()
+{
+    # 仅当容器里装了 docker 才检查
+    if [ ! -e "${CHROOT_DIR}/usr/bin/dockerd" ] && [ ! -e "${CHROOT_DIR}/usr/sbin/dockerd" ]; then
+        return 0
+    fi
+    # 未挂载 cgroup 目录时 /sys 可能不可见，跳过（启动流程会再提示）
+    [ -d "${CHROOT_DIR}/sys/fs/cgroup" ] || return 0
+    local missing="" c
+    for c in devices pids; do
+        # v1：/sys/fs/cgroup/<控制器>；v2：统一层级 + cgroup.controllers 中列出控制器
+        if [ -d "${CHROOT_DIR}/sys/fs/cgroup/${c}" ]; then
+            continue
+        fi
+        if [ -f "${CHROOT_DIR}/sys/fs/cgroup/cgroup.controllers" ] \
+            && grep -qw "${c}" "${CHROOT_DIR}/sys/fs/cgroup/cgroup.controllers" 2>/dev/null; then
+            continue
+        fi
+        missing="${missing} ${c}"
+    done
+    if [ -n "${missing}" ]; then
+        msg "[提示] 当前机型内核缺少 cgroup 控制器:${missing}，Docker 可能无法启动。"
+        msg "        这是内核/ROM 限制（容器内配置无法弥补），数据库等服务不受影响。"
+    fi
+    return 0
+}
+
 do_start()
 {
     if systemctl_running; then
@@ -112,6 +214,10 @@ do_start()
     # 修复：同上，pid 目录必须落在容器内，init 才能成功写 /run/systemctl/pid
     # （systemctl_running()/do_stop 都依赖该文件，缺失会导致重复拉起 init）
     make_dirs "${CHROOT_DIR}/run/systemctl"
+    # docker / containerd 在无 systemd 的 chroot 内的启动适配（未安装时不做任何事）
+    container_runtime_tune
+    # 内核缺少 devices/pids 等控制器时提示 Docker 不可用（不影响其它服务）
+    container_runtime_check
     # 拉起 init 前确保 ssh.service 已 enable：systemctl 的 default.target 才会
     # 启动 sshd（openssh 安装时未必 enable；此处兜底覆盖任何顺序/老容器）。
     # 发行版差异：debian/ubuntu/kali 用 ssh.service，centos/fedora/rhel 用 sshd.service，

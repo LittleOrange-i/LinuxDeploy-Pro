@@ -1416,6 +1416,46 @@ container_mounted()
     is_mounted "${CHROOT_DIR}"
 }
 
+# 挂载容器内 /sys/fs/cgroup（docker / containerd 的必要条件）
+# 背景：安卓宿主的 cgroup 层级通常未挂载、只挂了部分子系统，或已被系统的
+#       init 占用。容器内没有可用 cgroup 时 dockerd 直接启动失败。
+# 策略：优先复用宿主已有的 cgroup 挂载（bind，避免破坏安卓自身的层级），
+#       宿主完全没有时再在容器内自行挂一个 tmpfs + 各子系统（v1）或 cgroup2（v2）。
+#       仅 chroot 方式、且 /sys 已挂载（否则容器内看不到 /sys/fs）时处理。
+container_mount_cgroup()
+{
+    [ "${METHOD}" = "chroot" ] || return 0
+    local cg_dir="${CHROOT_DIR}/sys/fs/cgroup"
+    is_mounted "${CHROOT_DIR}/sys" || return 0
+    if is_mounted "${cg_dir}"; then
+        return 0
+    fi
+    [ -d "${cg_dir}" ] || mkdir -p "${cg_dir}"
+
+    # 宿主已有 cgroup 挂载：整体 bind 进容器（只读层级也可用，容器只写自己的子树）
+    if is_mounted "/sys/fs/cgroup"; then
+        if ! mount -o bind "/sys/fs/cgroup" "${cg_dir}" 2>/dev/null; then
+            msg "[提示] 无法挂载 cgroup（宿主 /sys/fs/cgroup 不可 bind），Docker 可能无法启动"
+        fi
+        return 0
+    fi
+
+    # 宿主没有 cgroup：v2（cgroup.controllers 存在表示内核已启用 v2）
+    if [ -e "/sys/fs/cgroup/cgroup.controllers" ]; then
+        mount -t cgroup2 none "${cg_dir}" 2>/dev/null && return 0
+    fi
+    # v1 兜底：统一挂 tmpfs 再按子系统分别挂载，失败项忽略（内核未编译该子系统）
+    if mount -t tmpfs -o uid=0,gid=0,mode=0755 cgroup "${cg_dir}" 2>/dev/null; then
+        local ctrl
+        for ctrl in cpu cpuset cpuacct memory devices freezer net_cls net_prio blkio pids hugetlb perf_event; do
+            [ -d "/sys/fs/cgroup/${ctrl}" ] || mkdir -p "${cg_dir}/${ctrl}"
+            mount -t cgroup -o "${ctrl}" cgroup "${cg_dir}/${ctrl}" 2>/dev/null || true
+        done
+    fi
+    # 挂载失败不算容器启动失败：仅 docker 受限，数据库等其它服务不受影响
+    return 0
+}
+
 # 文件系统检查（仅对 file/partition 类型的容器有效）
 fs_check()
 {
@@ -1720,7 +1760,10 @@ container_mount()
 
     if [ $# -eq 0 ]; then
         container_mount root proc sys dev shm pts fd tty tun binfmt_misc
-        return $?
+        local rc=$?
+        # cgroup 依赖 /sys 已挂载，单独处理且失败不阻断容器启动
+        container_mount_cgroup
+        return ${rc}
     fi
 
     params_check TARGET_PATH || return 1
@@ -1867,6 +1910,9 @@ container_start()
         container_mount || return 1
     elif ! is_mounted "${CHROOT_DIR}/proc"; then
         container_mount >/dev/null 2>&1 || true
+    else
+        # 已挂载（如部署后直接 start）：补上可能缺失的 cgroup
+        container_mount_cgroup
     fi
 
     local DO_ACTION='do_start'
