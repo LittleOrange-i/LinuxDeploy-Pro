@@ -77,12 +77,25 @@ normalize_packages()
     printf '%s' "${out}"
 }
 
+# 组件脚本内的日志：组件运行在子 shell 中，msg 的提示只写 debug 通道，
+# 这里同时写进当前日志文件。LOG_FILE 在 log_open 后已 export，子 shell 可继承。
+# 注意：会修改日志文件（追加），因此不能放进 $(...) 命令替换里调用。
+log_note()
+{
+    if [ -n "${LOG_FILE}" ]; then
+        printf '%s %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}" 2>/dev/null
+    fi
+    return 0
+}
+
 # 在子 shell 中执行命令，输出经 log_stream 实时回显并写入日志，
 # 返回原命令的真实退出码（解决管道吞退出码问题）
 log_exec()
 {
     local rc_file rc
-    rc_file=$(mktemp) || return 1
+    # 显式模板：安卓的 mktemp 不认 TMPDIR，裸 mktemp 会往不存在的 /tmp 写并失败
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    rc_file=$(mktemp "${TEMP_DIR}/ld-log.XXXXXX") || return 1
     # 在子 shell 内设置 EXIT trap 清理临时文件：子 shell 的 trap 仅作用于自身，
     # 不会覆盖调用方（部署流程的 deploy_cleanup 等）已注册的 EXIT trap，
     # 避免部署失败时漏卸载残留挂载。
@@ -163,6 +176,8 @@ log_open()
     # 时间戳命名（配置名-日期-时分秒）：每次操作独立日志文件，前端按最新文件尾随展示。
     LOG_FILE="${LOG_DIR}/${name}-$(date '+%Y%m%d-%H%M%S').log"
     : > "${LOG_FILE}" || { msg "[错误] 无法创建日志文件：${LOG_FILE}"; return 1; }
+    # 导出让组件子 shell 内的 log_note 能追加日志
+    export LOG_FILE
     # 日志文件 chown 给应用，使其可读取/删除
     if [ -n "${APP_UID}" ]; then
         if ! chown "${APP_UID}" "${LOG_FILE}" 2>/dev/null; then
@@ -395,7 +410,8 @@ ldstatus_running()
 # 先 TERM，等 1 秒，再对残留进程 KILL。
 kill_pids()
 {
-    local items="$@"
+    local items
+    items="$@"
     local item pid killed=0
     local failed_pids=""
     # 第一轮：对所有存活 pid 发 TERM（不逐进程 sleep）
@@ -444,7 +460,8 @@ kill_pids()
 # 删除文件列表
 remove_files()
 {
-    local files="$@"
+    local files
+    files="$@"
     file
     for file in ${files}
     do
@@ -455,7 +472,8 @@ remove_files()
 # 创建目录列表
 make_dirs()
 {
-    local dirs="$@"
+    local dirs
+    dirs="$@"
     local dir
     for dir in ${dirs}
     do
@@ -702,7 +720,8 @@ params_parse()
 # 检查必填参数是否齐全
 params_check()
 {
-    local params_list="$@"
+    local params_list
+    params_list="$@"
     local key val params_lost
     for key in ${params_list}
     do
@@ -1059,7 +1078,8 @@ config_import()
 # 判断组件是否与当前发行版/架构/代号兼容
 component_is_compatible()
 {
-    local target="$@"
+    local target
+    target="$@"
     [ -n "${target}" ] || return 0
     local item
     for item in ${target}
@@ -1093,7 +1113,13 @@ component_is_exclude()
 # 递归解析组件依赖，按依赖顺序输出组件列表
 component_depends()
 {
-    local components="$@"
+    # 注意：必须写成 "local components" 后再单独赋值，不能写 local components="$@"。
+    # mksh 的 local 即 typeset，会把展开后的每个词当作变量名处理：
+    # "typeset: bootstrap/ubuntu: is not an identifier" 报错并中断本次递归，
+    # 导致解析到 bootstrap 就停下，bootstrap/ubuntu、init、extra/ssh 全部丢失
+    # （脚本按 bash 写、设备端用 mksh 跑，本地复现不出来）。
+    local components
+    components="$@"
     [ -n "${components}" ] || return 0
     # 递归解析必须全部用 local，否则内层调用会覆盖外层循环变量 component
     local component conf_file TARGET DEPENDS
@@ -1113,8 +1139,12 @@ component_depends()
         fi
         # 读取组件声明（参数化解析，不用 eval $(grep ...)：
         # 组件配置文件若被篡改可执行任意命令）
-        TARGET=$(grep '^TARGET=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
-        DEPENDS=$(grep '^DEPENDS=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        # 末尾的 "|| true" 不可省略：多数组件 conf 不写 TARGET=（grep 返回 1），
+        # 而依赖解析处于命令替换中、继承调用方的 set -e——grep 失败会直接中断
+        # 整棵递归树，后续组件（如 bootstrap/ubuntu、init、extra/ssh）被静默丢弃，
+        # 表现为“执行计划只有 core 和 bootstrap、rootfs 从不安装”。
+        TARGET=$(grep '^TARGET=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//') || true
+        DEPENDS=$(grep '^DEPENDS=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//') || true
         # 参数化解析不会二次展开值内变量：DEPENDS 里写 ${DISTRIB} 之类
         # 会被当成字面目录名而静默跳过（历史上 bootstrap/${DISTRIB} 即栽在
         # 这里，导致发行版引导组件从不安装）。发现残留立即提示，防回归。
@@ -1125,7 +1155,12 @@ component_depends()
         esac
         # 兼容性检查
         if [ "${WITHOUT_CHECK}" != "true" ]; then
-            component_is_compatible ${TARGET} || continue
+            # 不兼容时写明原因：设备端曾出现"组件被静默跳过"反复排查困难，
+            # 这里把组件名、TARGET 与当前的 发行版:架构:代号 一并写入日志。
+            if ! component_is_compatible ${TARGET}; then
+                msg_depends "组件 ${component} 与 ${DISTRIB}:${ARCH}:${SUITE} 不兼容，已跳过（TARGET=${TARGET:-空}）"
+                continue
+            fi
         fi
         if [ "${REVERSE_DEPENDS}" = "true" ]; then
             # 反向依赖模式（帮助场景）
@@ -1142,7 +1177,8 @@ component_depends()
 # 执行组件动作（安装/配置/启动/停止/状态）
 component_exec()
 {
-    local components="$@"
+    local components
+    components="$@"
     if [ "${WITHOUT_DEPENDS}" != "true" ]; then
         components=$(IGNORE_DEPENDS=" " component_depends ${components})
     fi
@@ -1151,7 +1187,10 @@ component_exec()
         for COMPONENT in ${components}
         do
             COMPONENT_DIR="${INCLUDE_DIR}/${COMPONENT}"
-            [ -d "${COMPONENT_DIR}" ] || continue
+            [ -d "${COMPONENT_DIR}" ] || { msg_depends "组件目录不存在，跳过: ${COMPONENT_DIR}"; continue; }
+            # 逐组件进度写日志：组件脚本在 set -e 下中途退出时，最后一条
+            # "执行组件 X" 就是出错点，避免只看到前面几条配置日志就断了。
+            log_note "执行组件 ${COMPONENT} (${DO_ACTION})"
             # 重置组件声明变量
             unset NAME DESC TARGET PARAMS DEPENDS EXTENDS
             TARGET='*:*:*'
@@ -1198,7 +1237,8 @@ component_exec()
 # 列出组件（默认仅当前发行版兼容的）
 component_list()
 {
-    local components="$@"
+    local components
+    components="$@"
     local component output DESC
     if [ -z "${components}" ]; then
         components=$(cd "${INCLUDE_DIR}" && find . -type f -name "deploy.conf" | while read f
@@ -2425,6 +2465,20 @@ env_fix_permissions()
     chmod 755 "${INCLUDE_DIR}/bootstrap/debian/debootstrap/pkgdetails" 2>/dev/null || true
 }
 
+# 保证宿主 /tmp 可用。
+# 安卓根文件系统没有 /tmp；debootstrap 等第三方脚本在 chroot 内/外会裸调用
+# mktemp（且自身 unset 了 TMPDIR），失败即被 set -e 中断，表现为部署在
+# "正在安装 bootstrap/xxx" 后无输出地退出。这里优先使用已有的 /tmp，
+# 否则在 /tmp 指向可写的 /data/local/tmp（不可创建时退化为 TEMP_DIR）。
+env_ensure_tmp()
+{
+    [ -d /tmp ] && return 0
+    local t="/data/local/tmp"
+    [ -d "${t}" ] || t="${TEMP_DIR}"
+    [ -d "${t}" ] || return 0
+    ln -s "${t}" /tmp 2>/dev/null || true
+}
+
 # 补齐宿主缺失的工具软链并加入 PATH。
 # 安卓 toybox 没有 ar，镜像解包与 .deb 读取依赖它。
 env_init_tools()
@@ -2455,10 +2509,16 @@ env_init_tools()
     *) PATH="${TOOLS_DIR}:${PATH}" ;;
     esac
     export PATH
-    # HOME/TMPDIR 指向应用 tmp（安卓宿主 /tmp 通常不可写）。
+    # HOME/TMPDIR 指向应用 tmp（安卓宿主没有 /tmp）。
+    # 注意：debootstrap 脚本开头会 unset TMP/TEMP/TMPDIR，随后内部裸调用
+    # mktemp，会退回不存在的 /tmp 并失败（"mktemp: Failed to create file
+    # /tmp/tmp.xxx"），在 set -e 下中断整个部署。因此这里额外把 /tmp 兜底
+    # 指向宿主可写的临时目录；脚本内的 mktemp 也统一带显式模板。
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
     export HOME="${TEMP_DIR}"
     export TMPDIR="${TEMP_DIR}"
     export TMP="${TEMP_DIR}"
+    env_ensure_tmp
     mkdir -p "${TEMP_DIR}/xdg/wget" 2>/dev/null || true
     export XDG_DATA_HOME="${TEMP_DIR}/xdg"
 }
@@ -2688,6 +2748,41 @@ deploy)
     # 组件再次被静默跳过），赋值语句的变量展开则任何 POSIX shell 一致。
     distro_component=""
     [ -n "${DISTRIB}" ] && distro_component="bootstrap/${DISTRIB}"
+    # 组件执行计划写入日志：组件被静默跳过时（conf 缺失、TARGET 不兼容、
+    # 依赖解析异常），日志里至少能看出实际执行了哪些组件，避免再次出现
+    # "只有 core 在跑、rootfs 从未安装"却无从定位的情况。
+    msg "组件执行计划（拓扑排序后）: $(IGNORE_DEPENDS=' ' component_depends bootstrap ${distro_component} ${INCLUDE:-core} | tr '\n' ' ')"
+    # 环境诊断：设备上曾反复出现"bootstrap/ubuntu 没进计划"，需要一眼区分
+    # 是跑到了旧脚本、还是组件文件本身缺失/不可读。
+    msg "CLI 版本: ${VERSION} | 脚本: ${ENV_DIR}/cli.sh | 组件目录: ${INCLUDE_DIR}"
+    msg "发行版引导组件: ${distro_component}/deploy.conf $(
+        if [ -e "${INCLUDE_DIR}/${distro_component}/deploy.conf" ]; then
+            echo "存在"
+        else
+            echo "缺失"
+        fi)"
+    # 部署前硬校验：没有发行版引导组件就不可能安装 rootfs。若它没进执行计划
+    # （组件文件缺失、TARGET 不兼容、依赖解析异常），直接中止并说明原因，
+    # 避免 core 先跑一遍、最后只留下"容器系统文件不完整"这种间接报错。
+    deploy_plan=$(IGNORE_DEPENDS=' ' component_depends bootstrap ${distro_component} ${INCLUDE:-core})
+    case "
+${deploy_plan}
+" in
+    *"
+${distro_component}
+"*) ;;
+    *)
+        msg "[错误] 部署中止：${distro_component} 未进入执行计划，系统无法安装。"
+        if [ ! -e "${INCLUDE_DIR}/${distro_component}/deploy.conf" ]; then
+            msg "        原因：组件文件缺失（${INCLUDE_DIR}/${distro_component}/deploy.conf 不存在）。"
+            msg "        请在应用「设置 → 重装运行环境」后重试；仍缺失说明安装包内没有该组件。"
+        else
+            msg "        原因：组件存在但被依赖解析跳过（见上方“组件...已跳过”提示）。"
+            msg "        请把这份日志完整反馈给开发者。"
+        fi
+        exit 1
+    ;;
+esac
     component_exec bootstrap ${distro_component} ${INCLUDE:-core}
     deploy_rc=$?
     # 部署后完整性校验：debootstrap 内部失败一般会让 component_exec 非 0
@@ -2702,6 +2797,13 @@ deploy)
         [ -e "${CHROOT_DIR}/bin/sh" ] || deploy_miss="${deploy_miss} /bin/sh"
         if [ -n "${deploy_miss}" ]; then
             msg "[错误] 容器系统文件不完整（缺少:${deploy_miss}），部署未真正完成。"
+            # 目录里连 debootstrap 工作目录都没有：一阶段没走完（下载/解包前就退了），
+            # 和"解包到一半"区分开，便于判断是安装源问题还是解包/磁盘问题。
+            if [ "${TARGET_TYPE:-directory}" = "directory" ] && [ ! -d "${CHROOT_DIR}/debootstrap" ] \
+                && [ -z "$(ls -A "${CHROOT_DIR}" 2>/dev/null)" ]; then
+                msg "        目录里没有任何系统文件，说明 debootstrap 一阶段在下载/解包前就退出了。"
+                msg "        请确认手机能访问安装源：${SOURCE_PATH:-默认源}（可先用浏览器/其他下载工具测试该地址）"
+            fi
             msg "        常见原因：安装源不可用、网络中断或组件被跳过（见上方日志）。"
             msg "        排查网络/安装源后重新部署；若重复出现，请把完整部署日志反馈给开发者。"
             # 校验失败按部署失败处理：退出码置 1，前端不再误报"部署完成"

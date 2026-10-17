@@ -28,15 +28,21 @@ fi
 # - sudo：权限管理
 # - man-db：手册数据库
 # - python3：systemctl（python 实现）运行依赖
-# - fish：用户要求默认安装的 shell
-BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3,fish"
+# 注意：debootstrap 一阶段只索引 main 分区，非 main 的包（如 fish）会报
+# "E: Couldn't find these debs" 直接中断部署；这类包放到二阶段配好完整源
+# 后用 apt 安装（见 do_install）。
+BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3"
 # 排除包清单（容器内不需要 init 与 systemd 引导）
 BASE_EXCLUDE_PACKAGES="init,systemd-sysv"
+# 一阶段完成后额外安装的包（依赖非 main 分区，需先配好完整 apt 源）
+BASE_UNIVERSE_PACKAGES="fish"
 
 # apt 安装辅助函数：更新索引并静默安装指定包
 apt_install()
 {
-    local packages="$@"
+    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
+    local packages
+    packages="$@"
     [ -n "${packages}" ] || return 1
     (set -e
         log_exec chroot_exec -u root apt-get update -yq
@@ -94,7 +100,8 @@ do_install()
     # 使用官方 debootstrap（本项目内置 1.0.144）
     local DEBOOTSTRAP_DIR rc_file debootstrap_rc
     DEBOOTSTRAP_DIR="$(component_dir bootstrap/debian)/debootstrap"
-    rc_file=$(mktemp) || return 1
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    rc_file=$(mktemp "${TEMP_DIR}/ld-debootstrap.XXXXXX") || return 1
 
     # 一阶段：仅解包基础系统到目标目录
     # --no-check-gpg：跳过 Release 签名校验（离线/镜像场景必需）
@@ -129,7 +136,7 @@ do_install()
 
     # 二阶段：在 chroot 内完成包配置
     unset DEBOOTSTRAP_DIR
-    rc_file=$(mktemp) || return 1
+    rc_file=$(mktemp "${TEMP_DIR}/ld-second.XXXXXX") || return 1
     (
         chroot_exec /debootstrap/debootstrap --no-check-gpg --second-stage 2>&1
         echo $? > "${rc_file}"
@@ -158,6 +165,14 @@ do_install()
     msg "正在安装 command-not-found ..."
     apt_install command-not-found
     is_ok || msg "[警告] command-not-found 安装失败（不影响容器使用）"
+
+    # 安装非 main 分区的默认包（fish）。此处在完整源配置后执行，
+    # 失败不阻断部署：基础系统已可用，shell 缺失只需手动 apt install 补装。
+    if [ -n "${BASE_UNIVERSE_PACKAGES}" ]; then
+        msg "正在安装 ${BASE_UNIVERSE_PACKAGES} ..."
+        apt_install ${BASE_UNIVERSE_PACKAGES}
+        is_ok || msg "[警告] ${BASE_UNIVERSE_PACKAGES} 安装失败（可在容器内执行 apt install 补装）"
+    fi
 
     # 安装额外软件包（可选，CLI 命令行参数仍支持）
     if [ -n "${EXTRA_PACKAGES}" ]; then

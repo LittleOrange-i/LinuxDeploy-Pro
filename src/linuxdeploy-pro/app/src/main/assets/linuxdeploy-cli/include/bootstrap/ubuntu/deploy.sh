@@ -113,6 +113,13 @@ do_install()
     # --extractor=ar：安卓环境缺少 dpkg-deb 时的降级解包器
     # 注意：必须以"执行"方式调用官方 debootstrap，绝不可 source（source 时 $0 变成外层 shell，save_variables 的 cp "$0" 会拿 shell 名当文件复制）
     # 输出经 log_stream 实时回显并写入日志文件
+    # debootstrap 失败时只有 info 级输出（W:/E:），安卓上典型表现是
+    # 卡在下载 Release/Packages 无声退出；这里前后附上阶段提示与退出码，
+    # 方便直接判断是网络/安装源问题还是解包问题。
+    log_note ":: debootstrap 一阶段（下载并解包 ${SUITE}/${ARCH}）..."
+    if [ "${TARGET_TYPE:-directory}" = "directory" ]; then
+        log_note "   安装方式: 目录（${CHROOT_DIR}），源: ${SOURCE_PATH}"
+    fi
     (
         env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
         echo $? > "${rc_file}"
@@ -120,9 +127,11 @@ do_install()
     debootstrap_rc=$(cat "${rc_file}")
     rm -f "${rc_file}"
     if [ "${debootstrap_rc}" -ne 0 ]; then
+        log_note "debootstrap 一阶段失败（退出码 ${debootstrap_rc}）"
         msg "debootstrap 一阶段失败（退出码 ${debootstrap_rc}），请检查安装源与网络"
         return 1
     fi
+    log_note "debootstrap 一阶段完成"
 
     # 一阶段完成：容器内已具备 glibc，此时启用构建期 statx 兼容层
     # （内核 <5.8 时，systemd≥260 的 postinst 需要 STATX_MNT_ID，见 cli.sh）

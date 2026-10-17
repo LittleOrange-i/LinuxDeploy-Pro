@@ -77,6 +77,17 @@ normalize_packages()
     printf '%s' "${out}"
 }
 
+# 组件脚本内的日志：组件运行在子 shell 中，msg 的提示只写 debug 通道，
+# 这里同时写进当前日志文件。LOG_FILE 在 log_open 后已 export，子 shell 可继承。
+# 注意：会修改日志文件（追加），因此不能放进 $(...) 命令替换里调用。
+log_note()
+{
+    if [ -n "${LOG_FILE}" ]; then
+        printf '%s %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}" 2>/dev/null
+    fi
+    return 0
+}
+
 # 在子 shell 中执行命令，输出经 log_stream 实时回显并写入日志，
 # 返回原命令的真实退出码（解决管道吞退出码问题）
 log_exec()
@@ -172,6 +183,8 @@ log_open()
             msg "[警告] chown ${APP_UID} ${LOG_DIR}失败"
         fi
     fi
+    # 导出让组件子 shell 内的 log_note 能追加日志
+    export LOG_FILE
     msg "日志文件: ${LOG_FILE}"
 }
 
@@ -1113,8 +1126,12 @@ component_depends()
         fi
         # 读取组件声明（参数化解析，不用 eval $(grep ...)：
         # 组件配置文件若被篡改可执行任意命令）
-        TARGET=$(grep '^TARGET=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
-        DEPENDS=$(grep '^DEPENDS=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        # 末尾的 "|| true" 不可省略：多数组件 conf 不写 TARGET=（grep 返回 1），
+        # 而依赖解析处于命令替换中、继承调用方的 set -e——grep 失败会直接中断
+        # 整棵递归树，后续组件（如 bootstrap/ubuntu、init、extra/ssh）被静默丢弃，
+        # 表现为“执行计划只有 core 和 bootstrap、rootfs 从不安装”。
+        TARGET=$(grep '^TARGET=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//') || true
+        DEPENDS=$(grep '^DEPENDS=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//') || true
         # 参数化解析不会二次展开值内变量：DEPENDS 里写 ${DISTRIB} 之类
         # 会被当成字面目录名而静默跳过（历史上 bootstrap/${DISTRIB} 即栽在
         # 这里，导致发行版引导组件从不安装）。发现残留立即提示，防回归。
@@ -1125,7 +1142,12 @@ component_depends()
         esac
         # 兼容性检查
         if [ "${WITHOUT_CHECK}" != "true" ]; then
-            component_is_compatible ${TARGET} || continue
+            # 不兼容时写明原因：设备端曾出现"组件被静默跳过"反复排查困难，
+            # 这里把组件名、TARGET 与当前的 发行版:架构:代号 一并写入日志。
+            if ! component_is_compatible ${TARGET}; then
+                msg_depends "组件 ${component} 与 ${DISTRIB}:${ARCH}:${SUITE} 不兼容，已跳过（TARGET=${TARGET:-空}）"
+                continue
+            fi
         fi
         if [ "${REVERSE_DEPENDS}" = "true" ]; then
             # 反向依赖模式（帮助场景）
@@ -2688,6 +2710,41 @@ deploy)
     # 组件再次被静默跳过），赋值语句的变量展开则任何 POSIX shell 一致。
     distro_component=""
     [ -n "${DISTRIB}" ] && distro_component="bootstrap/${DISTRIB}"
+    # 组件执行计划写入日志：组件被静默跳过时（conf 缺失、TARGET 不兼容、
+    # 依赖解析异常），日志里至少能看出实际执行了哪些组件，避免再次出现
+    # "只有 core 在跑、rootfs 从未安装"却无从定位的情况。
+    msg "组件执行计划（拓扑排序后）: $(IGNORE_DEPENDS=' ' component_depends bootstrap ${distro_component} ${INCLUDE:-core} | tr '\n' ' ')"
+    # 环境诊断：设备上曾反复出现"bootstrap/ubuntu 没进计划"，需要一眼区分
+    # 是跑到了旧脚本、还是组件文件本身缺失/不可读。
+    msg "CLI 版本: ${VERSION} | 脚本: ${ENV_DIR}/cli.sh | 组件目录: ${INCLUDE_DIR}"
+    msg "发行版引导组件: ${distro_component}/deploy.conf $(
+        if [ -e "${INCLUDE_DIR}/${distro_component}/deploy.conf" ]; then
+            echo "存在"
+        else
+            echo "缺失"
+        fi)"
+    # 部署前硬校验：没有发行版引导组件就不可能安装 rootfs。若它没进执行计划
+    # （组件文件缺失、TARGET 不兼容、依赖解析异常），直接中止并说明原因，
+    # 避免 core 先跑一遍、最后只留下"容器系统文件不完整"这种间接报错。
+    deploy_plan=$(IGNORE_DEPENDS=' ' component_depends bootstrap ${distro_component} ${INCLUDE:-core})
+    case "
+${deploy_plan}
+" in
+    *"
+${distro_component}
+"*) ;;
+    *)
+        msg "[错误] 部署中止：${distro_component} 未进入执行计划，系统无法安装。"
+        if [ ! -e "${INCLUDE_DIR}/${distro_component}/deploy.conf" ]; then
+            msg "        原因：组件文件缺失（${INCLUDE_DIR}/${distro_component}/deploy.conf 不存在）。"
+            msg "        请在应用「设置 → 重装运行环境」后重试；仍缺失说明安装包内没有该组件。"
+        else
+            msg "        原因：组件存在但被依赖解析跳过（见上方“组件...已跳过”提示）。"
+            msg "        请把这份日志完整反馈给开发者。"
+        fi
+        exit 1
+    ;;
+esac
     component_exec bootstrap ${distro_component} ${INCLUDE:-core}
     deploy_rc=$?
     # 部署后完整性校验：debootstrap 内部失败一般会让 component_exec 非 0
@@ -2702,6 +2759,13 @@ deploy)
         [ -e "${CHROOT_DIR}/bin/sh" ] || deploy_miss="${deploy_miss} /bin/sh"
         if [ -n "${deploy_miss}" ]; then
             msg "[错误] 容器系统文件不完整（缺少:${deploy_miss}），部署未真正完成。"
+            # 目录里连 debootstrap 工作目录都没有：一阶段没走完（下载/解包前就退了），
+            # 和"解包到一半"区分开，便于判断是安装源问题还是解包/磁盘问题。
+            if [ "${TARGET_TYPE:-directory}" = "directory" ] && [ ! -d "${CHROOT_DIR}/debootstrap" ] \
+                && [ -z "$(ls -A "${CHROOT_DIR}" 2>/dev/null)" ]; then
+                msg "        目录里没有任何系统文件，说明 debootstrap 一阶段在下载/解包前就退出了。"
+                msg "        请确认手机能访问安装源：${SOURCE_PATH:-默认源}（可先用浏览器/其他下载工具测试该地址）"
+            fi
             msg "        常见原因：安装源不可用、网络中断或组件被跳过（见上方日志）。"
             msg "        排查网络/安装源后重新部署；若重复出现，请把完整部署日志反馈给开发者。"
             # 校验失败按部署失败处理：退出码置 1，前端不再误报"部署完成"

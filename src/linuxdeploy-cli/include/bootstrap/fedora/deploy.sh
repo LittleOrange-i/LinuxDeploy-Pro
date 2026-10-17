@@ -20,7 +20,9 @@ fi
 
 dnf_install()
 {
-    local packages="$@"
+    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
+    local packages
+    packages="$@"
     [ -n "${packages}" ] || return 1
     (set -e
         chroot_exec -u root dnf -y install ${packages}

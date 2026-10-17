@@ -38,15 +38,21 @@ fi
 # - sudo：权限管理
 # - man-db：手册数据库
 # - python3：systemctl（python 实现）运行依赖
-# - fish：用户要求默认安装的 shell
-BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3,fish"
+# 注意：debootstrap 一阶段只索引 main 分区，universe 里的包（如 fish）会报
+# "E: Couldn't find these debs: fish" 直接中断部署；这类包放到二阶段
+# 配好 main/universe/multiverse 源后再用 apt 安装（见 do_install）。
+BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3"
 # 排除包清单（容器内不需要 init 与 systemd 引导）
 BASE_EXCLUDE_PACKAGES="init,systemd-sysv"
+# 一阶段完成后额外安装的包（依赖 non-main 分区，需先配好完整 apt 源）
+BASE_UNIVERSE_PACKAGES="fish"
 
 # apt 安装辅助函数：更新索引并静默安装指定包（与 bootstrap/debian 相同）
 apt_install()
 {
-    local packages="$@"
+    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
+    local packages
+    packages="$@"
     [ -n "${packages}" ] || return 1
     (set -e
         log_exec chroot_exec -u root apt-get update -yq
@@ -105,7 +111,8 @@ do_install()
     # scripts 目录含 Ubuntu 各代号脚本）
     local DEBOOTSTRAP_DIR rc_file debootstrap_rc
     DEBOOTSTRAP_DIR="$(component_dir bootstrap/debian)/debootstrap"
-    rc_file=$(mktemp) || return 1
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    rc_file=$(mktemp "${TEMP_DIR}/ld-debootstrap.XXXXXX") || return 1
 
     # 一阶段：仅解包基础系统到目标目录
     # --no-check-gpg：跳过 Release 签名校验（离线/镜像场景必需）
@@ -113,6 +120,13 @@ do_install()
     # --extractor=ar：安卓环境缺少 dpkg-deb 时的降级解包器
     # 注意：必须以"执行"方式调用官方 debootstrap，绝不可 source（source 时 $0 变成外层 shell，save_variables 的 cp "$0" 会拿 shell 名当文件复制）
     # 输出经 log_stream 实时回显并写入日志文件
+    # debootstrap 失败时只有 info 级输出（W:/E:），安卓上典型表现是
+    # 卡在下载 Release/Packages 无声退出；这里前后附上阶段提示与退出码，
+    # 方便直接判断是网络/安装源问题还是解包问题。
+    log_note ":: debootstrap 一阶段（下载并解包 ${SUITE}/${ARCH}）..."
+    if [ "${TARGET_TYPE:-directory}" = "directory" ]; then
+        log_note "   安装方式: 目录（${CHROOT_DIR}），源: ${SOURCE_PATH}"
+    fi
     (
         env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
         echo $? > "${rc_file}"
@@ -120,9 +134,11 @@ do_install()
     debootstrap_rc=$(cat "${rc_file}")
     rm -f "${rc_file}"
     if [ "${debootstrap_rc}" -ne 0 ]; then
+        log_note "debootstrap 一阶段失败（退出码 ${debootstrap_rc}）"
         msg "debootstrap 一阶段失败（退出码 ${debootstrap_rc}），请检查安装源与网络"
         return 1
     fi
+    log_note "debootstrap 一阶段完成"
 
     # 一阶段完成：容器内已具备 glibc，此时启用构建期 statx 兼容层
     # （内核 <5.8 时，systemd≥260 的 postinst 需要 STATX_MNT_ID，见 cli.sh）
@@ -140,7 +156,7 @@ do_install()
 
     # 二阶段：在 chroot 内完成包配置
     unset DEBOOTSTRAP_DIR
-    rc_file=$(mktemp) || return 1
+    rc_file=$(mktemp "${TEMP_DIR}/ld-second.XXXXXX") || return 1
     (
         chroot_exec /debootstrap/debootstrap --no-check-gpg --second-stage 2>&1
         echo $? > "${rc_file}"
@@ -168,6 +184,14 @@ do_install()
     msg "正在安装 command-not-found ..."
     apt_install command-not-found
     is_ok || msg "[警告] command-not-found 安装失败（不影响容器使用）"
+
+    # 安装非 main 分区的默认包（fish 在 universe）。此处在完整源配置后执行，
+    # 失败不阻断部署：基础系统已可用，shell 缺失只需手动 apt install 补装。
+    if [ -n "${BASE_UNIVERSE_PACKAGES}" ]; then
+        msg "正在安装 ${BASE_UNIVERSE_PACKAGES} ..."
+        apt_install ${BASE_UNIVERSE_PACKAGES}
+        is_ok || msg "[警告] ${BASE_UNIVERSE_PACKAGES} 安装失败（可在容器内执行 apt install 补装）"
+    fi
 
     # 安装额外软件包（可选，CLI 命令行参数仍支持）
     if [ -n "${EXTRA_PACKAGES}" ]; then

@@ -39,8 +39,16 @@ object CliManager {
      * 4.1.19-r6：mksh 不支持 ${DISTRIB:+bootstrap/${DISTRIB}} 嵌套展开（r5 修复在设备端
      *            仍未生效，bootstrap 组件被静默跳过），改用普通赋值展开；依赖解析提示
      *            改写部署日志文件（stderr 在非 debug 模式被丢弃，stdout 会污染组件列表）。
-     *            【改 assets 必须同步 bump 此标记，否则覆盖安装后设备继续用旧脚本】 */
-    private const val EXTRACT_MARKER = "4.1.19-r6"
+     *            【改 assets 必须同步 bump 此标记，否则覆盖安装后设备继续用旧脚本】
+     * 4.1.19-r7：补上 assets 缺失的 include/bootstrap/ubuntu（组件缺失时被静默跳过、
+     *            部署日志里连一行 debootstrap 输出都没有）；部署日志新增"组件执行计划"、
+     *            debootstrap 一阶段起止与退出码；校验失败提示区分"目录完全为空"
+     * 4.1.19-r8：component_depends 读取 TARGET=/DEPENDS= 的 grep 在 set -e 下失败即中断
+     *            递归（多数 conf 无 TARGET= 行），导致 bootstrap/ubuntu、init、extra/ssh
+     *            被静默丢弃、只剩 core 在跑；读取改为容错，不再中断依赖树
+     * 4.1.19-r9：部署前打印 CLI 版本/脚本路径/组件目录/引导组件是否存在，
+     *            并硬校验 bootstrap/发行版 必须进入执行计划，否则直接中止并说明原因 */
+    private const val EXTRACT_MARKER = "4.1.19-r9"
 
     /** CLI 版本（与 cli.sh 内 VERSION 对应，仅用于日志显示） */
     const val CLI_VERSION = "4.0"
