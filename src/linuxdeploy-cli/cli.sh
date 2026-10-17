@@ -3035,7 +3035,20 @@ deploy)
     # 组件执行计划写入日志：组件被静默跳过时（conf 缺失、TARGET 不兼容、
     # 依赖解析异常），日志里至少能看出实际执行了哪些组件，避免再次出现
     # "只有 core 在跑、rootfs 从未安装"却无从定位的情况。
-    msg "组件执行计划（拓扑排序后）: $(IGNORE_DEPENDS=' ' component_depends bootstrap ${distro_component} ${INCLUDE:-core} | tr '\n' ' ')"
+    # 这里展示的是“实际执行顺序”：引导组件在前，core/extra/init 在 rootfs 就绪后执行
+    msg "组件执行计划（实际执行顺序）: $(
+        _plan=$(IGNORE_DEPENDS=' ' component_depends bootstrap ${distro_component} ${INCLUDE:-core})
+        _pre=""
+        _post=""
+        for _c in ${_plan}
+        do
+            case "${_c}" in
+            bootstrap|bootstrap/*) _pre="${_pre} ${_c}" ;;
+            *) _post="${_post} ${_c}" ;;
+            esac
+        done
+        echo "${_pre# }${_post}"
+    )"
     # 环境诊断：设备上曾反复出现"bootstrap/ubuntu 没进计划"，需要一眼区分
     # 是跑到了旧脚本、还是组件文件本身缺失/不可读。
     msg "CLI 版本: ${VERSION} | 脚本: ${ENV_DIR}/cli.sh | 组件目录: ${INCLUDE_DIR}"
@@ -3067,8 +3080,40 @@ ${distro_component}
         exit 1
     ;;
 esac
-    component_exec bootstrap ${distro_component} ${INCLUDE:-core}
+    # 部署执行顺序拆成两段：先装 rootfs（bootstrap 系列），再配置容器内系统。
+    # 原因：组件拓扑排序是“先依赖、后自身”，core 依赖 bootstrap 只保证 core
+    # 整组排在 core 之前被输出，但 core/* 子组件仍会先于 bootstrap/${DISTRIB}
+    # 展开执行。而 core/hostname（装包）、core/profile（写 /etc/shadow）、
+    # core/aid、core/timezone 等都必须在 rootfs 就绪后才能跑，否则 apt/chroot
+    # 无可用系统会直接卡死（表现为"正在安装 core/hostname ..."后无响应）。
+    # 这里显式把 core 依赖拆成两批执行，顺序稳定且不改动各组件自身声明。
+    deploy_plan=$(IGNORE_DEPENDS=' ' component_depends bootstrap ${distro_component} ${INCLUDE:-core})
+    pre_components=""
+    post_components=""
+    for _c in ${deploy_plan}
+    do
+        case "${_c}" in
+        bootstrap|bootstrap/*)
+            # 引导组件：生成 rootfs，必须最先执行
+            pre_components="${pre_components} ${_c}"
+        ;;
+        *)
+            # 其余组件（含依赖 rootfs 的 core/*）：rootfs 就绪后再执行
+            post_components="${post_components} ${_c}"
+        ;;
+        esac
+    done
+    # 引导组件无论依赖如何都排在最前（避免 core 先于 rootfs 安装）。
+    # WITHOUT_DEPENDS=true：按上面排好的顺序直接执行，不再二次解析依赖，
+    # 否则 component_exec 会重新拓扑排序，打乱 pre/post 的分段顺序。
+    WITHOUT_DEPENDS=true component_exec ${pre_components# }
     deploy_rc=$?
+    if [ "${deploy_rc}" -eq 0 ] && [ -n "${post_components# }" ]; then
+        # 引导完成后执行剩余组件（core 配置、extra/ssh、init 等）；
+        # 这些组件已按依赖排好序，直接执行即可，无需再次解析依赖
+        WITHOUT_DEPENDS=true component_exec ${post_components# }
+        deploy_rc=$?
+    fi
     # 部署后完整性校验：debootstrap 内部失败一般会让 component_exec 非 0
     # 退出，但个别异常（解压不完整却成功返回）只能靠文件级校验兜底，
     # 避免"部署完成"掩盖 rootfs 缺失、拖到启动时才以一句"失败"暴露。
