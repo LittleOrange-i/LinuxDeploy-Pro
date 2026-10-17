@@ -35,6 +35,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.ganyu256.linuxdeploypro.data.StorageValidator
 import io.github.ganyu256.linuxdeploypro.model.ContainerConfig
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Card
@@ -80,11 +81,15 @@ private val DISTRO_LABELS = mapOf(
  * 清空后回退发行版官方源（CLI 层处理）。
  * 注意：
  * - 统一用 http；
- * - alpine / archlinux 用清华镜像（USTC 索引文件不可下）。
+ * - alpine / archlinux 用清华镜像（USTC 索引文件不可下）；
+ * - ubuntu 用阿里云镜像（2026-10 实测：清华 TUNA 对非浏览器自动化访问返回 403
+ *   拦截，debootstrap/wget 高频抓取易触发；阿里云 http/https 均正常开放，
+ *   ubuntu-ports/dists/jammy/Release 校验通过：Codename jammy、含 arm64、
+ *   main/universe/multiverse 组件齐全）。
  */
 private val DISTRO_MIRRORS = mapOf(
     "debian" to "http://mirrors.ustc.edu.cn/debian/",
-    "ubuntu" to "http://mirrors.ustc.edu.cn/ubuntu-ports/",
+    "ubuntu" to "http://mirrors.aliyun.com/ubuntu-ports/",
     "kali" to "http://mirrors.ustc.edu.cn/kali/",
     "alpine" to "http://mirrors.tuna.tsinghua.edu.cn/alpine/",
     "archlinux" to "http://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/",
@@ -142,6 +147,10 @@ fun ConfigScreen(
 
     // 安装设置
     var installType by rememberSaveable(initial?.installType) { mutableStateOf(initial?.installType ?: "directory") }
+
+    // 路径实时校验（输入即查）：路径提示与保存按钮共用同一结论
+    val pathText = pathState.text.toString()
+    val pathResult = StorageValidator.validate(pathText, installType)
 
     // SSH 设置（旧配置可能在 INCLUDE 里带 extra/ssh 但没有 sshEnabled，读入时一并同步）
     var sshEnabled by rememberSaveable(initial?.sshEnabled, initial?.components) {
@@ -282,18 +291,104 @@ fun ConfigScreen(
                         selectedIndex = if (installType == "image") 1 else 0,
                         onSelectedIndexChange = { installType = if (it == 1) "image" else "directory" },
                     )
+                    // 安装方式说明：把两种方式的区别翻译成大白话，帮用户选对
+                    Text(
+                        text = if (installType == "image") {
+                            "把 Linux 装进一个镜像文件：文件放哪都行（包括手机共享存储），装不下时还能随时扩容。"
+                        } else {
+                            "把 Linux 装进一个普通文件夹：速度快、占用小。注意：文件夹不能放在共享存储" +
+                                "（相册、下载所在的地方），否则会无法启动。"
+                        },
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onSurfaceContainerVariant.copy(alpha = 0.8f),
+                    )
                     if (installType == "image") {
                         HorizontalDivider()
                         LabeledTextField(
                             label = "镜像大小",
                             state = imageSizeState,
+                            hint = "给 Linux 预留的空间，装不下时可随时调大",
                         )
                     }
                     HorizontalDivider()
                     LabeledTextField(
                         label = "容器路径",
                         state = pathState,
+                        hint = if (installType == "image") "镜像文件会自动保存在这个路径，文件名后面加 .img" else null,
                     )
+                    // 路径实时校验：填错立即提示并给出修正入口，不等保存/部署才发现
+                    if (pathResult.message != null) {
+                        Text(
+                            text = if (pathResult.ok) "✓ ${pathResult.message}" else pathResult.message,
+                            modifier = Modifier.padding(horizontal = 16.dp),
+                            fontSize = 12.sp,
+                            color = if (pathResult.ok) Color(0xFF43A047) else Color(0xFFE53935),
+                        )
+                        // 共享存储 + 目录方式：提供一键修正（换推荐路径 / 改用镜像方式）
+                        if (!pathResult.ok && pathResult.sharedStorage) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                Text(
+                                    text = "一键换成推荐路径",
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable {
+                                            val rec = StorageValidator
+                                                .recommendations(context, nameState.text.toString())
+                                                .firstOrNull()?.second ?: "/data/local/tmp/linux"
+                                            pathState.edit { replace(0, length, rec) }
+                                        }
+                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.primary,
+                                )
+                                Text(
+                                    text = "改用镜像安装",
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { installType = "image" }
+                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.primary,
+                                )
+                            }
+                        }
+                    }
+                    // 推荐路径：点一下直接填入，免去手动抄写
+                    val recommendations = StorageValidator.recommendations(
+                        context,
+                        nameState.text.toString(),
+                    )
+                    recommendations.forEach { (label, path) ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    pathState.edit { replace(0, pathState.text.length, path) }
+                                }
+                                .padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "用「$label」",
+                                fontSize = 13.sp,
+                                color = MiuixTheme.colorScheme.primary,
+                            )
+                            Spacer(modifier = Modifier.padding(horizontal = 6.dp))
+                            Text(
+                                text = path,
+                                fontSize = 12.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceContainerVariant.copy(alpha = 0.7f),
+                                maxLines = 1,
+                            )
+                        }
+                    }
                 }
             }
 
@@ -538,14 +633,23 @@ fun ConfigScreen(
             Spacer(modifier = Modifier.padding(top = 4.dp))
 
             Button(
+                enabled = pathResult.ok,
                 onClick = {
                     val trimmed = nameState.text.toString().trim()
                     if (trimmed.isEmpty()) {
                         Toast.makeText(context, "配置名称不能为空", Toast.LENGTH_SHORT).show()
                         return@Button
                     }
-                    // 路径为空会写出缺 CHROOT_DIR/TARGET_PATH 的配置，因此路径必填。
+                    // 双保险：即使按钮状态异常，保存前仍按校验结论拦截
                     val pathTrimmed = pathState.text.toString().trim()
+                    if (!pathResult.ok) {
+                        Toast.makeText(
+                            context,
+                            pathResult.message ?: "容器路径暂不可用，请按页面提示修改",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@Button
+                    }
                     if (pathTrimmed.isEmpty()) {
                         Toast.makeText(context, "请填写容器路径", Toast.LENGTH_LONG).show()
                         return@Button

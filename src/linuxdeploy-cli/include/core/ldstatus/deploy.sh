@@ -27,6 +27,21 @@ do_start()
         return 0
     fi
     msg -n ":: 启动 ${COMPONENT} ... "
+    # 预检容器内执行环境：缺文件时给出大白话原因。最常见根因是 rootfs
+    # 解压不完整（部署日志中"未检测到 glibc"即同类信号），缺 bash/setsid/sleep
+    # 会让本组件静默失败，提前拦截避免用户只看到一句"失败"无从下手。
+    local missing=""
+    local f
+    for f in /usr/local/sbin/ldstatus /bin/bash /bin/setsid /bin/sleep; do
+        [ -e "${CHROOT_DIR}${f}" ] || missing="${missing} ${f}"
+    done
+    if [ -n "${missing}" ]; then
+        msg "失败"
+        msg "[提示] 容器内缺少运行所需的系统文件:${missing}"
+        msg "        通常说明容器系统文件不完整（上次部署没有真正完成）。"
+        msg "        解决：在配置页重新部署一次；若部署过程报错，请先解决部署错误再启动。"
+        return 1
+    fi
     chroot_exec /usr/local/sbin/ldstatus
     local ld_rc=$?
     # 等待容器内 pid 文件出现（≤3s），随后覆盖写入配置侧锚点

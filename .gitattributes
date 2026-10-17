@@ -14,6 +14,7 @@
 *.jpg binary
 *.webp binary
 *.jar binary
+*.so binary
 debootstrap binary
 pkgdetails binary
 **/tools/* binary

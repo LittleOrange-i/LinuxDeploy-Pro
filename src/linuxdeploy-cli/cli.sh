@@ -32,6 +32,20 @@ msg()
     fi
 }
 
+# 组件依赖解析专用提示：component_depends 运行在 $(...) 命令替换内，
+# stdout 会混进组件列表、stderr 在非 debug 模式被 exec 2>/dev/null 丢弃，
+# 因此提示直接写入日志文件（部署日志可见）；debug 模式下 stderr 同步输出。
+msg_depends()
+{
+    if [ -n "${LOG_FILE}" ]; then
+        printf '%s %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}"
+    fi
+    if [ "${DEBUG_MODE}" = "true" ]; then
+        echo "[提示] $*" >&2
+    fi
+    return 0
+}
+
 # 原始输出流式处理：逐行实时回显，并同步写入当前日志文件
 # 用于 debootstrap / apt 等直接向 stdout 输出原始文本的环节。
 # 注意：管道会吞掉退出码，需配合 log_exec 或在外部自行捕获。
@@ -264,6 +278,49 @@ is_mounted()
     fi
     [ -n "${real}" ] || real="${target}"
     grep -q " ${real} " /proc/mounts
+}
+
+# 判断路径是否位于共享存储（/storage/emulated/0、/sdcard 这类 FUSE/sdcardfs 视图）。
+# 共享存储的挂载标志固定 noexec/nosuid/nodev 且被内核锁定：目录型容器 bind 进来后
+# 无法运行任何程序，remount 也无法修正。返回 0 = 位于共享存储。
+is_shared_storage()
+{
+    local p="$1" fs
+    [ -n "${p}" ] || return 1
+    p=$(readlink -f "${p}" 2>/dev/null) || p="$1"
+    [ -n "${p}" ] || p="$1"
+    # 常见共享存储前缀快速判定（覆盖绝大多数设备）
+    case "${p}" in
+    /storage/emulated/*|/storage/sdcard*|/sdcard|/sdcard/*|/mnt/sdcard/*|/mnt/media_rw/*|/mnt/runtime/*)
+        return 0
+    ;;
+    /storage/*)
+        # /storage/<UUID>（如 /storage/0000-0000，外置卡/OTG）同为共享存储视图
+        local seg="${p#/storage/}"
+        seg="${seg%%/*}"
+        case "${seg}" in
+        emulated|self|scratch) return 0 ;;
+        # 4 位数字开头的十六进制卷 UUID 段
+        [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]*) return 0 ;;
+        esac
+    ;;
+    esac
+    # 兜底：沿路径向父级回溯，匹配 /proc/mounts 中的 FUSE 类挂载
+    # （覆盖 ROM 自定义的共享存储挂载位置）
+    local tmp="${p%/}"
+    while : ; do
+        [ -z "${tmp}" ] && tmp="/"
+        fs=$(awk -v m="${tmp}" '$2==m{print $3; exit}' /proc/mounts 2>/dev/null)
+        case "${fs}" in
+        fuse|fuse.*|sdcardfs|esdfs|davfs2|ncfs) return 0 ;;
+        esac
+        [ "${tmp}" = "/" ] && break
+        case "${tmp}" in
+        */*) tmp="${tmp%/*}" ;;
+        *) tmp="/" ;;
+        esac
+    done
+    return 1
 }
 
 # 判断路径是否为归档文件
@@ -1046,13 +1103,26 @@ component_depends()
         # 防止循环依赖
         [ -z "${IGNORE_DEPENDS##* ${component} *}" ] && continue
         IGNORE_DEPENDS="${IGNORE_DEPENDS}${component} "
-        # 组件必须存在
+        # 组件必须存在：缺失时明确提示（组件名拼错/conf 丢失最常见）。
+        # 本函数运行在 $(...) 命令替换内（component_exec 依赖解析），提示
+        # 必须写 stderr，否则会混进组件列表被当作组件名执行。
         conf_file="${INCLUDE_DIR}/${component}/deploy.conf"
-        [ -e "${conf_file}" ] || continue
+        if [ ! -e "${conf_file}" ]; then
+            msg_depends "组件 ${component} 不存在，已跳过（找不到 ${conf_file}）"
+            continue
+        fi
         # 读取组件声明（参数化解析，不用 eval $(grep ...)：
         # 组件配置文件若被篡改可执行任意命令）
         TARGET=$(grep '^TARGET=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
         DEPENDS=$(grep '^DEPENDS=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+        # 参数化解析不会二次展开值内变量：DEPENDS 里写 ${DISTRIB} 之类
+        # 会被当成字面目录名而静默跳过（历史上 bootstrap/${DISTRIB} 即栽在
+        # 这里，导致发行版引导组件从不安装）。发现残留立即提示，防回归。
+        case "${TARGET} ${DEPENDS}" in
+        *'${'*)
+            msg_depends "组件 ${component} 的 TARGET/DEPENDS 含未展开变量引用（将被忽略），请在调用处显式传入"
+        ;;
+        esac
         # 兼容性检查
         if [ "${WITHOUT_CHECK}" != "true" ]; then
             component_is_compatible ${TARGET} || continue
@@ -1312,13 +1382,51 @@ mount_part()
     root)
         msg -n "/ ... "
         if ! is_mounted "${CHROOT_DIR}" ; then
+            # 目录型容器强制挂载源=容器目录：历史配置可能残留旧 TARGET_PATH
+            # （如先建镜像后改目录、或旧版本未同步该字段），bind 挂旧路径会把
+            # 空目录盖在部署内容上，表现为"部署成功但容器内一片空白"。
+            if [ "${TARGET_TYPE}" = "directory" ] && [ "${TARGET_PATH}" != "${CHROOT_DIR}" ]; then
+                msg "[提示] 目录安装的挂载源(${TARGET_PATH})与容器目录(${CHROOT_DIR})不一致，已按容器目录处理。"
+                TARGET_PATH="${CHROOT_DIR}"
+            fi
+            # 防御拦截：目录型容器不允许放在共享存储（/storage/emulated/0、/sdcard 等）。
+            # 共享存储禁止把文件当程序运行（noexec 被内核锁定），挂上后容器内所有命令
+            # 都会 Permission denied；提前拦截并给出小白可读的修正指引。
+            if [ -d "${TARGET_PATH}" ] && is_shared_storage "${TARGET_PATH}"; then
+                msg "失败"
+                msg "[提示] 容器路径在手机共享存储（/storage/emulated/0、/sdcard 这类放相册和下载的地方）。"
+                msg "        系统规定共享存储里的文件不能当作程序运行，目录方式放这里会无法启动。"
+                msg "        两个解决办法（改一下配置就好）："
+                msg "          ① 把容器路径换成系统目录，如 /data/local/tmp/${CURRENT_CONF:-linux}；"
+                msg "          ② 把安装方式改成「镜像（ext4 镜像文件）」——镜像文件放共享存储没问题。"
+                return 1
+            fi
             [ -d "${CHROOT_DIR}" ] || mkdir -p "${CHROOT_DIR}"
             local mnt_opts
             # 目录型容器使用 bind 挂载，文件型容器直接挂载
             [ -d "${TARGET_PATH}" ] && mnt_opts="bind" || mnt_opts="rw,relatime"
-            mount -o ${mnt_opts} "${TARGET_PATH}" "${CHROOT_DIR}" &&
-            mount -o remount,exec,suid,dev "${CHROOT_DIR}"
-            is_ok "失败" "完成" || return 1
+            if mount -o ${mnt_opts} "${TARGET_PATH}" "${CHROOT_DIR}"; then
+                if mount -o remount,exec,suid,dev "${CHROOT_DIR}"; then
+                    is_ok "失败" "完成"
+                else
+                    # remount 失败必须回滚：残留挂载会让状态查询误报"运行中"
+                    umount "${CHROOT_DIR}" 2>/dev/null
+                    msg "失败"
+                    if [ "${mnt_opts}" = "bind" ]; then
+                        msg "[提示] 挂载完成但无法开启「运行程序」权限，已自动撤销挂载。"
+                        msg "        容器路径所在的存储不允许运行程序（如共享存储、部分外置存储卡）。"
+                        msg "        请更换容器路径（如 /data/local/tmp/xxx）或改用镜像方式安装。"
+                    else
+                        msg "[提示] 无法开启「运行程序」权限，已自动撤销挂载，请检查容器路径所在的存储。"
+                    fi
+                    return 1
+                fi
+            else
+                msg "失败"
+                msg "[提示] 无法挂载容器路径: ${TARGET_PATH}"
+                msg "        请确认路径以 / 开头（绝对路径）且真实存在。"
+                return 1
+            fi
         else
             msg "跳过"
         fi
@@ -2067,7 +2175,12 @@ do_check()
 
     # 容器目录
     if [ -n "${CHROOT_DIR}" ]; then
-        if [ -d "${CHROOT_DIR}" ]; then
+        # 目录型容器不允许放在共享存储（与启动拦截一致，部署前提前诊断）
+        if [ "${TARGET_TYPE:-directory}" = "directory" ] && is_shared_storage "${TARGET_PATH:-${CHROOT_DIR}}"; then
+            msg "[失败] 容器路径在共享存储（/storage/emulated/0、/sdcard 这类放相册和下载的地方），共享存储不允许运行程序，目录方式放这里会无法启动"
+            msg "       请把容器路径换成系统目录（如 /data/local/tmp/xxx），或把安装方式改成「镜像（ext4 镜像文件）」"
+            fail=$((fail+1))
+        elif [ -d "${CHROOT_DIR}" ]; then
             if [ -n "$(ls -A "${CHROOT_DIR}" 2>/dev/null)" ]; then
                 msg "[警告] 容器目录非空（可能已部署）: ${CHROOT_DIR}"
                 warn=$((warn+1))
@@ -2566,8 +2679,38 @@ deploy)
     # 执行安装与配置。
     # 显式把 bootstrap 放在最前：bootstrap 依赖 core，组件拓扑排序会
     # 自动先跑 core 再跑 bootstrap，避免"core 配置先于容器部署"的顺序错误。
-    component_exec bootstrap ${INCLUDE:-core}
-    exit $?
+    # bootstrap/${DISTRIB} 必须在调用处展开：组件 conf 的 DEPENDS 经
+    # grep/sed 参数化解析（不经 eval，防注入），值内的 ${DISTRIB} 永远
+    # 不会二次展开，写在 conf 里会让 bootstrap/ubuntu|debian 被静默跳过、
+    # rootfs 从未安装（部署秒完成、启动必失败）。
+    # 用普通赋值展开而非 ${DISTRIB:+bootstrap/${DISTRIB}}：嵌套展开在
+    # 不同 shell 实现间行为有差异（设备端 mksh 实测未展开，bootstrap
+    # 组件再次被静默跳过），赋值语句的变量展开则任何 POSIX shell 一致。
+    distro_component=""
+    [ -n "${DISTRIB}" ] && distro_component="bootstrap/${DISTRIB}"
+    component_exec bootstrap ${distro_component} ${INCLUDE:-core}
+    deploy_rc=$?
+    # 部署后完整性校验：debootstrap 内部失败一般会让 component_exec 非 0
+    # 退出，但个别异常（解压不完整却成功返回）只能靠文件级校验兜底，
+    # 避免"部署完成"掩盖 rootfs 缺失、拖到启动时才以一句"失败"暴露。
+    if [ "${deploy_rc}" -eq 0 ] && [ "${dry_run}" != "true" ]; then
+        deploy_miss=""
+        # 动态链接器（glibc: ld-linux-*；musl: ld-musl-*），二选一必须存在
+        if ! find "${CHROOT_DIR}/lib" "${CHROOT_DIR}/usr/lib" -maxdepth 2 \( -name "ld-linux-*.so*" -o -name "ld-musl-*.so*" \) 2>/dev/null | grep -q .; then
+            deploy_miss=" 动态链接器(ld-linux/ld-musl)"
+        fi
+        [ -e "${CHROOT_DIR}/bin/sh" ] || deploy_miss="${deploy_miss} /bin/sh"
+        if [ -n "${deploy_miss}" ]; then
+            msg "[错误] 容器系统文件不完整（缺少:${deploy_miss}），部署未真正完成。"
+            msg "        常见原因：安装源不可用、网络中断或组件被跳过（见上方日志）。"
+            msg "        排查网络/安装源后重新部署；若重复出现，请把完整部署日志反馈给开发者。"
+            # 校验失败按部署失败处理：退出码置 1，前端不再误报"部署完成"
+            deploy_rc=1
+        else
+            msg "[通过] 容器系统文件校验通过"
+        fi
+    fi
+    exit ${deploy_rc}
 ;;
 
 start)

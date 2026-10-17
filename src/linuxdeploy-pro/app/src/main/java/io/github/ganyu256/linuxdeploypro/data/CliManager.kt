@@ -31,8 +31,16 @@ object CliManager {
 
     /** 解压标记：改动此值可强制重新解压（升级 CLI 时用）。
      * 4.1.19-r2：解压时增加 BOM/CRLF 规范化，强制覆盖设备上被污染的旧脚本
-     * 4.1.19-r3：CLI 参数重建修复 + statx_shim 预编译产物随 assets 分发 */
-    private const val EXTRACT_MARKER = "4.1.19-r3"
+     * 4.1.19-r3：CLI 参数重建修复 + statx_shim 预编译产物随 assets 分发
+     * 4.1.19-r4：共享存储目录型拦截 + mount 失败回滚 + ldstatus 启动预检 + 部署后 rootfs 完整性校验
+     * 4.1.19-r5：bootstrap/${DISTRIB} 不展开导致发行版引导组件被静默跳过（rootfs 从不安装），
+     *            改为 deploy 调用处显式展开；组件缺失/变量残留 stderr 提示；
+     *            部署后校验失败退出码置 1；目录型挂载源强制与容器目录一致。
+     * 4.1.19-r6：mksh 不支持 ${DISTRIB:+bootstrap/${DISTRIB}} 嵌套展开（r5 修复在设备端
+     *            仍未生效，bootstrap 组件被静默跳过），改用普通赋值展开；依赖解析提示
+     *            改写部署日志文件（stderr 在非 debug 模式被丢弃，stdout 会污染组件列表）。
+     *            【改 assets 必须同步 bump 此标记，否则覆盖安装后设备继续用旧脚本】 */
+    private const val EXTRACT_MARKER = "4.1.19-r6"
 
     /** CLI 版本（与 cli.sh 内 VERSION 对应，仅用于日志显示） */
     const val CLI_VERSION = "4.0"
