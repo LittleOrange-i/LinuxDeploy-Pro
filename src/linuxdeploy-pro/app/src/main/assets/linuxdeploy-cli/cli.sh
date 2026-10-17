@@ -93,7 +93,9 @@ log_note()
 log_exec()
 {
     local rc_file rc
-    rc_file=$(mktemp) || return 1
+    # 显式模板：安卓的 mktemp 不认 TMPDIR，裸 mktemp 会往不存在的 /tmp 写并失败
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    rc_file=$(mktemp "${TEMP_DIR}/ld-log.XXXXXX") || return 1
     # 在子 shell 内设置 EXIT trap 清理临时文件：子 shell 的 trap 仅作用于自身，
     # 不会覆盖调用方（部署流程的 deploy_cleanup 等）已注册的 EXIT trap，
     # 避免部署失败时漏卸载残留挂载。
@@ -174,6 +176,8 @@ log_open()
     # 时间戳命名（配置名-日期-时分秒）：每次操作独立日志文件，前端按最新文件尾随展示。
     LOG_FILE="${LOG_DIR}/${name}-$(date '+%Y%m%d-%H%M%S').log"
     : > "${LOG_FILE}" || { msg "[错误] 无法创建日志文件：${LOG_FILE}"; return 1; }
+    # 导出让组件子 shell 内的 log_note 能追加日志
+    export LOG_FILE
     # 日志文件 chown 给应用，使其可读取/删除
     if [ -n "${APP_UID}" ]; then
         if ! chown "${APP_UID}" "${LOG_FILE}" 2>/dev/null; then
@@ -183,8 +187,6 @@ log_open()
             msg "[警告] chown ${APP_UID} ${LOG_DIR}失败"
         fi
     fi
-    # 导出让组件子 shell 内的 log_note 能追加日志
-    export LOG_FILE
     msg "日志文件: ${LOG_FILE}"
 }
 
@@ -408,7 +410,8 @@ ldstatus_running()
 # 先 TERM，等 1 秒，再对残留进程 KILL。
 kill_pids()
 {
-    local items="$@"
+    local items
+    items="$@"
     local item pid killed=0
     local failed_pids=""
     # 第一轮：对所有存活 pid 发 TERM（不逐进程 sleep）
@@ -457,7 +460,8 @@ kill_pids()
 # 删除文件列表
 remove_files()
 {
-    local files="$@"
+    local files
+    files="$@"
     file
     for file in ${files}
     do
@@ -468,7 +472,8 @@ remove_files()
 # 创建目录列表
 make_dirs()
 {
-    local dirs="$@"
+    local dirs
+    dirs="$@"
     local dir
     for dir in ${dirs}
     do
@@ -584,6 +589,13 @@ statx_shim_prepare()
     return 0
 }
 
+# 把参数按 POSIX 单引号规则转义，供容器内 sh -c 安全还原。
+# 用法：shell_quote "a b" → 'a b'；单引号写成 '\''
+shell_quote()
+{
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # 在 chroot 容器内执行命令
 # 用法：chroot_exec [-u 用户] 命令 [参数...]
 chroot_exec()
@@ -592,7 +604,11 @@ chroot_exec()
     unset TMP TEMP TMPDIR LD_DEBUG
     local path="${PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     local username=""
-    # 构建期 statx 兼容层注入开关：仅当部署流程把 shim 装进容器后才生效
+    # 构建期 statx 兼容层注入开关：仅当部署流程把 shim 装进容器后才生效。
+    # 注意：LD_PRELOAD 必须作用在"容器内被执行的程序"上，绝不能 export 给
+    # 宿主侧 chroot 进程本身——宿主动态链接器会去解容器内路径的库，
+    # 且 shim 依赖容器内的 libpthread，宿主上必然 "CANNOT LINK EXECUTABLE"。
+    # 因此这里改为在容器内用 sh -c 显式带上环境变量前缀。
     local shim_lib="/usr/lib/linuxdeploy/statx-shim.so"
     local shim_preload=""
     if [ -e "${CHROOT_DIR}${shim_lib}" ]; then
@@ -618,11 +634,15 @@ chroot_exec()
         fi
     else
         if [ -n "${shim_preload}" ]; then
-            # 局部变量作用域：仅在本次 chroot 调用期间设置 LD_PRELOAD
-            # 用 (subshell) 包裹确保环境变量不会污染父 shell 或其他并发调用
-            ( export LD_PRELOAD="${shim_lib}"; PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" "$@" 3>&- )
-            local rc=$?
-            return ${rc}
+            # 由容器内的 /bin/sh 解释命令串，LD_PRELOAD 只作用于其子进程。
+            # 命令参数用 "sh -c '前缀 + 原命令'" 方式传递，保持原有参数边界。
+            local cmd=""
+            local a
+            for a in "$@"; do
+                cmd="${cmd} $(shell_quote "${a}")"
+            done
+            PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" /bin/sh -c "${shim_preload}${cmd}" 3>&-
+            return $?
         fi
         # 用 "$@" 保持参数边界，避免命令串被二次解析。
         PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" "$@" 3>&-
@@ -715,7 +735,8 @@ params_parse()
 # 检查必填参数是否齐全
 params_check()
 {
-    local params_list="$@"
+    local params_list
+    params_list="$@"
     local key val params_lost
     for key in ${params_list}
     do
@@ -1072,7 +1093,8 @@ config_import()
 # 判断组件是否与当前发行版/架构/代号兼容
 component_is_compatible()
 {
-    local target="$@"
+    local target
+    target="$@"
     [ -n "${target}" ] || return 0
     local item
     for item in ${target}
@@ -1106,7 +1128,13 @@ component_is_exclude()
 # 递归解析组件依赖，按依赖顺序输出组件列表
 component_depends()
 {
-    local components="$@"
+    # 注意：必须写成 "local components" 后再单独赋值，不能写 local components="$@"。
+    # mksh 的 local 即 typeset，会把展开后的每个词当作变量名处理：
+    # "typeset: bootstrap/ubuntu: is not an identifier" 报错并中断本次递归，
+    # 导致解析到 bootstrap 就停下，bootstrap/ubuntu、init、extra/ssh 全部丢失
+    # （脚本按 bash 写、设备端用 mksh 跑，本地复现不出来）。
+    local components
+    components="$@"
     [ -n "${components}" ] || return 0
     # 递归解析必须全部用 local，否则内层调用会覆盖外层循环变量 component
     local component conf_file TARGET DEPENDS
@@ -1164,7 +1192,8 @@ component_depends()
 # 执行组件动作（安装/配置/启动/停止/状态）
 component_exec()
 {
-    local components="$@"
+    local components
+    components="$@"
     if [ "${WITHOUT_DEPENDS}" != "true" ]; then
         components=$(IGNORE_DEPENDS=" " component_depends ${components})
     fi
@@ -1173,7 +1202,10 @@ component_exec()
         for COMPONENT in ${components}
         do
             COMPONENT_DIR="${INCLUDE_DIR}/${COMPONENT}"
-            [ -d "${COMPONENT_DIR}" ] || continue
+            [ -d "${COMPONENT_DIR}" ] || { msg_depends "组件目录不存在，跳过: ${COMPONENT_DIR}"; continue; }
+            # 逐组件进度写日志：组件脚本在 set -e 下中途退出时，最后一条
+            # "执行组件 X" 就是出错点，避免只看到前面几条配置日志就断了。
+            log_note "执行组件 ${COMPONENT} (${DO_ACTION})"
             # 重置组件声明变量
             unset NAME DESC TARGET PARAMS DEPENDS EXTENDS
             TARGET='*:*:*'
@@ -1220,7 +1252,8 @@ component_exec()
 # 列出组件（默认仅当前发行版兼容的）
 component_list()
 {
-    local components="$@"
+    local components
+    components="$@"
     local component output DESC
     if [ -z "${components}" ]; then
         components=$(cd "${INCLUDE_DIR}" && find . -type f -name "deploy.conf" | while read f
@@ -2447,24 +2480,42 @@ env_fix_permissions()
     chmod 755 "${INCLUDE_DIR}/bootstrap/debian/debootstrap/pkgdetails" 2>/dev/null || true
 }
 
+# 保证宿主 /tmp 可用。
+# 安卓根文件系统没有 /tmp；debootstrap 等第三方脚本在 chroot 内/外会裸调用
+# mktemp（且自身 unset 了 TMPDIR），失败即被 set -e 中断，表现为部署在
+# "正在安装 bootstrap/xxx" 后无输出地退出。这里优先使用已有的 /tmp，
+# 否则在 /tmp 指向可写的 /data/local/tmp（不可创建时退化为 TEMP_DIR）。
+env_ensure_tmp()
+{
+    [ -d /tmp ] && return 0
+    local t="/data/local/tmp"
+    [ -d "${t}" ] || t="${TEMP_DIR}"
+    [ -d "${t}" ] || return 0
+    ln -s "${t}" /tmp 2>/dev/null || true
+}
+
 # 生成 HTTPS 用的 CA 证书包（PEM），输出路径到 stdout；失败不输出。
 # 背景：宿主 wget（GNU Wget2）不读安卓系统证书库 /system/etc/security/cacerts，
 # 直接访问 https 源会报 "Certificate error"。debootstrap 支持
 # --ca-certificate=FILE，把系统证书合并成单个 PEM 交给它即可在保持证书校验
 # 的前提下使用 https 源（而不是用 --no-check-certificate 关闭校验）。
+# 合并结果缓存在 TEMP_DIR，超过 7 天或证书目录更新时重建。
 env_ca_bundle()
 {
     local bundle="${TEMP_DIR}/ca-bundle.pem"
     local cacert_dir="/system/etc/security/cacerts"
     [ -d "${cacert_dir}" ] || return 1
     if [ -s "${bundle}" ]; then
-        local age now
+        # 交叉 /proc/uptime 与文件时间不可比，这里用简单时效：7 天（604800 秒）
+        local age
         age=$(stat -c %Y "${bundle}" 2>/dev/null || echo 0)
-        now=$(date +%s 2>/dev/null || echo 0)
-        if [ "${age}" -gt 0 ] 2>/dev/null && [ "${now}" -gt 0 ] 2>/dev/null \
-            && [ $((now - age)) -lt 604800 ]; then
-            echo "${bundle}"
-            return 0
+        if [ "${age}" -gt 0 ] 2>/dev/null; then
+            local now
+            now=$(date +%s 2>/dev/null || echo 0)
+            if [ "${now}" -gt 0 ] && [ $((now - age)) -lt 604800 ]; then
+                echo "${bundle}"
+                return 0
+            fi
         fi
     fi
     mkdir -p "${TEMP_DIR}" 2>/dev/null || return 1
@@ -2522,10 +2573,16 @@ env_init_tools()
     *) PATH="${TOOLS_DIR}:${PATH}" ;;
     esac
     export PATH
-    # HOME/TMPDIR 指向应用 tmp（安卓宿主 /tmp 通常不可写）。
+    # HOME/TMPDIR 指向应用 tmp（安卓宿主没有 /tmp）。
+    # 注意：debootstrap 脚本开头会 unset TMP/TEMP/TMPDIR，随后内部裸调用
+    # mktemp，会退回不存在的 /tmp 并失败（"mktemp: Failed to create file
+    # /tmp/tmp.xxx"），在 set -e 下中断整个部署。因此这里额外把 /tmp 兜底
+    # 指向宿主可写的临时目录；脚本内的 mktemp 也统一带显式模板。
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
     export HOME="${TEMP_DIR}"
     export TMPDIR="${TEMP_DIR}"
     export TMP="${TEMP_DIR}"
+    env_ensure_tmp
     mkdir -p "${TEMP_DIR}/xdg/wget" 2>/dev/null || true
     export XDG_DATA_HOME="${TEMP_DIR}/xdg"
 }

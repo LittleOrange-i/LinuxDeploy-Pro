@@ -59,6 +59,36 @@ android {
     }
 }
 
+/**
+ * 构建前自动同步 CLI 到 APK assets。
+ *
+ * src/linuxdeploy-cli 是权威版本：每次 assemble/install 前都会把它覆盖进
+ * app/src/main/assets/linuxdeploy-cli，杜绝"改了源码却忘记复制 assets、设备
+ * 仍在跑旧脚本"的问题（曾导致 bootstrap 组件被静默跳过、部署秒失败）。
+ * 设备端 CliManager 按 assets 内容指纹判断是否重新解压，无需手工改版本号。
+ */
+val cliRepoDir = rootProject.file("../linuxdeploy-cli")
+val assetsCliDir = file("src/main/assets/linuxdeploy-cli")
+
+// 运行时目录与开发机脚本不随 APK 分发
+val cliSyncExcludes = listOf("config", "tmp", "builds", ".git", "scripts/regression.sh")
+
+val syncCli = tasks.register<Sync>("syncCli") {
+    description = "把 src/linuxdeploy-cli 同步到 app assets/linuxdeploy-cli"
+    group = "build"
+    doFirst {
+        require(cliRepoDir.isDirectory) { "CLI 源目录不存在: $cliRepoDir" }
+        logger.lifecycle("[sync-cli] ${cliRepoDir} -> ${assetsCliDir}")
+    }
+    from(cliRepoDir) {
+        cliSyncExcludes.forEach { exclude(it) }
+    }
+    into(assetsCliDir)
+}
+
+// assets 必须在 mergeAssets 之前就位
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(syncCli) }
+
 dependencies {
     // Compose BOM：统一管理 androidx.compose 各组件版本
     implementation(platform("androidx.compose:compose-bom:2026.06.01"))

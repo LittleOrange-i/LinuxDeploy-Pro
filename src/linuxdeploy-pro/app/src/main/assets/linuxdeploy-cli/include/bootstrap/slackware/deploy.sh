@@ -23,7 +23,9 @@ fi
 
 slackpkg_install()
 {
-    local packages="$@"
+    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
+    local packages
+    packages="$@"
     [ -n "${packages}" ] || return 1
     (set -e
         chroot_exec -u root "yes | slackpkg -checkgpg=off -batch=on -default_answer=y update" || true

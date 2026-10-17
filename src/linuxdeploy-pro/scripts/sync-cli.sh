@@ -9,11 +9,12 @@
 # 用法：scripts/sync-cli.sh [--check]
 #   --check   只报告差异，不复制（CI 或提交前自检用）
 #
+# 注意：Gradle 构建已内置同等同步（app/build.gradle.kts 的 syncCli 任务，
+# 每次 assemble/install 前自动执行），本脚本仅用于不跑 Gradle 时手动同步。
+#
 # 复制范围：
-#   cli.sh、statx_shim.c、statx_test.c、include/、docs/、LICENSE、README.md
-#   + include/bootstrap/debian/debootstrap/pkgdetails（静态二进制）
-# 注意：tools/（busybox/wget/e2fsck/resize2fs/mke2fs）由 buildtools 构建，
-#   不在此脚本范围（见 /root/Ganyu256/buildtools/build.sh deploy）。
+#   cli.sh、statx_shim.c、statx_test.c、include/、docs/、LICENSE、README.md、tools/
+# 排除：config/、tmp/、builds/、scripts/regression.sh（开发机专用）
 ################################################################################
 
 set -e
@@ -26,9 +27,9 @@ CHECK_ONLY=0
 
 [ -f "${CLI}/cli.sh" ] || { echo "!! CLI 仓库路径无效: ${CLI}（可用 CLI_REPO= 覆盖）"; exit 1; }
 
-# 排除项：APK 侧维护的本地内容不覆盖
-EXCLUDES=(--exclude='.git' --exclude='config' --exclude='tmp' --exclude='scripts'
-          --exclude='tools' --exclude='*.log' --exclude='*.bak')
+# 排除项：运行时目录与开发机脚本
+EXCLUDES=(--exclude='.git' --exclude='config' --exclude='tmp' --exclude='builds'
+          --exclude='scripts/regression.sh' --exclude='*.log' --exclude='*.bak')
 
 if [ "${CHECK_ONLY}" = "1" ]; then
     echo "==> [sync-cli] 差异检查（CLI 仓库 vs APK assets）："

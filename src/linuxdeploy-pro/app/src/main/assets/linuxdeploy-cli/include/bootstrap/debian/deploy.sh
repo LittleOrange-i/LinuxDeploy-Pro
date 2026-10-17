@@ -19,8 +19,9 @@ then
 fi
 
 # 软件源，默认中科大 HTTP 镜像源
-# 说明：https 源同样受支持（cli.sh 会合并系统 CA 传给 debootstrap）；
-# 若网络对镜像存在劫持，可在配置中指定 --source-path 覆盖为其他源
+# 说明：https 源同样受支持（cli.sh 合并系统 CA 后传给 debootstrap
+# --ca-certificate，保持证书校验）；若网络对镜像存在劫持，可在配置中
+# 指定 --source-path 覆盖为其他源
 [ -n "${SOURCE_PATH}" ] || SOURCE_PATH="http://mirrors.ustc.edu.cn/debian/"
 
 # 基础安装包清单（trixie 实测通过）

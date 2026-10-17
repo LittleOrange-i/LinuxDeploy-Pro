@@ -4,7 +4,8 @@ rem ============================================================
 rem LinuxDeploy-Pro 快速构建安装脚本
 rem 用法:
 rem   run.bat            构建 + 覆盖安装 + 启动（保留容器配置，
-rem                      CLI 运行环境按 EXTRACT_MARKER 自动刷新）
+rem                      CLI 在构建前自动从 src/linuxdeploy-cli 同步，
+rem                      设备端按 assets 指纹自动重新解压）
 rem   run.bat --clear    同上，但先完全清除应用数据后全新初始化
 rem                      （会删除应用内容器配置；/data/local/tmp 下的
 rem                      容器目录不受影响；用于彻底排除旧数据干扰）
@@ -51,5 +52,5 @@ if errorlevel 1 (
     echo [警告] 应用启动命令执行失败，可手动打开应用确认。
 )
 
-echo [完成] 部署成功。若修改过 assets/linuxdeploy-cli，确认 CliManager.EXTRACT_MARKER 已提升版本。
+echo [完成] 部署成功。CLI 已在构建前自动同步到 assets，指纹变化时应用会自动重解压。
 endlocal

@@ -29,31 +29,12 @@ object CliManager {
     /** assets 里的 CLI 目录名 */
     private const val ASSET_ROOT = "linuxdeploy-cli"
 
-    /** 解压标记：改动此值可强制重新解压（升级 CLI 时用）。
-     * 4.1.19-r2：解压时增加 BOM/CRLF 规范化，强制覆盖设备上被污染的旧脚本
-     * 4.1.19-r3：CLI 参数重建修复 + statx_shim 预编译产物随 assets 分发
-     * 4.1.19-r4：共享存储目录型拦截 + mount 失败回滚 + ldstatus 启动预检 + 部署后 rootfs 完整性校验
-     * 4.1.19-r5：bootstrap/${DISTRIB} 不展开导致发行版引导组件被静默跳过（rootfs 从不安装），
-     *            改为 deploy 调用处显式展开；组件缺失/变量残留 stderr 提示；
-     *            部署后校验失败退出码置 1；目录型挂载源强制与容器目录一致。
-     * 4.1.19-r6：mksh 不支持 ${DISTRIB:+bootstrap/${DISTRIB}} 嵌套展开（r5 修复在设备端
-     *            仍未生效，bootstrap 组件被静默跳过），改用普通赋值展开；依赖解析提示
-     *            改写部署日志文件（stderr 在非 debug 模式被丢弃，stdout 会污染组件列表）。
-     *            【改 assets 必须同步 bump 此标记，否则覆盖安装后设备继续用旧脚本】
-     * 4.1.19-r7：补上 assets 缺失的 include/bootstrap/ubuntu（组件缺失时被静默跳过、
-     *            部署日志里连一行 debootstrap 输出都没有）；部署日志新增"组件执行计划"、
-     *            debootstrap 一阶段起止与退出码；校验失败提示区分"目录完全为空"
-     * 4.1.19-r8：component_depends 读取 TARGET=/DEPENDS= 的 grep 在 set -e 下失败即中断
-     *            递归（多数 conf 无 TARGET= 行），导致 bootstrap/ubuntu、init、extra/ssh
-     *            被静默丢弃、只剩 core 在跑；读取改为容错，不再中断依赖树
-     * 4.1.19-r9：部署前打印 CLI 版本/脚本路径/组件目录/引导组件是否存在，
-     *            并硬校验 bootstrap/发行版 必须进入执行计划，否则直接中止并说明原因
-     * 4.1.19-r10：HTTPS 源支持——合并安卓系统 CA 为 PEM 传给 debootstrap
-     *            --ca-certificate（保持证书校验，不关闭）；wget 缓存变量透传；
-     *            mksh local "$@" 兼容；debootstrap 临时文件走 TEMP_DIR；
-     *            fish 等非 main 分区包改到二阶段 apt 安装；
-     *            debootstrap scripts 符号链接实体化（APK assets 不支持链接） */
-    private const val EXTRACT_MARKER = "4.1.19-r10"
+    /** 解压标记兜底值（仅在无法计算 assets 校验和时使用）。
+     * 早期这里是手工维护的 4.1.19-rN 版本号，必须每次改 assets 手动 bump；
+     * 曾因漏 bump 导致设备显示"已是最新"却仍在跑旧脚本（bootstrap 组件被跳过）。
+     * 现在改为 [assetDigest]：运行时对 assets 内容算校验和，任何脚本改动都会
+     * 自动触发重新解压，无需再手工提升版本。 */
+    private const val EXTRACT_MARKER_FALLBACK = "unknown"
 
     /** CLI 版本（与 cli.sh 内 VERSION 对应，仅用于日志显示） */
     const val CLI_VERSION = "4.0"
@@ -118,17 +99,55 @@ object CliManager {
         cliDir?.takeIf { it.exists() }?.let { return it }
         val target = File(context.filesDir, ASSET_ROOT)
         return try {
-            if (!target.exists()) {
+            // 以 assets 内容校验和作为解压标记：安装包里的脚本一变，标记就变，
+            // 覆盖安装后会自动重新解压，不依赖人工维护版本号。
+            val marker = assetDigest(context) ?: EXTRACT_MARKER_FALLBACK
+            if (!target.exists() || markerVersion(target) != marker) {
+                // 逐文件合并覆盖，保留 config/、builds/、.current。
                 extractAssets(context, target)
-            } else if (markerVersion(target) != EXTRACT_MARKER) {
-                // 版本不一致时逐文件合并覆盖，保留 config/、builds/、.current。
-                extractAssets(context, target)
+                File(target, ".version").writeText(marker)
             }
-            File(target, ".version").writeText(EXTRACT_MARKER)
             cliDir = target
             target
         } catch (e: Exception) {
             cliDir = null
+            null
+        }
+    }
+
+    /**
+     * 计算 assets/linuxdeploy-cli 的内容指纹（SHA-256，前 16 位十六进制）。
+     *
+     * 覆盖所有文件路径与内容，所以任何脚本/配置改动都会得到不同的指纹：
+     * 新安装包首次启动即自动重新解压，不需要再手工 bump 版本常量。
+     * 结果缓存在内存中，同一次运行只算一次。
+     */
+    @Volatile
+    private var cachedDigest: String? = null
+
+    @Synchronized
+    private fun assetDigest(context: Context): String? {
+        cachedDigest?.let { return it }
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            fun feed(path: String) {
+                val entries = context.assets.list(path) ?: return
+                for (name in entries.sorted()) {
+                    val childPath = "$path/$name"
+                    if (context.assets.list(childPath)?.isNotEmpty() == true) {
+                        feed(childPath)
+                    } else {
+                        md.update(childPath.toByteArray())
+                        md.update(context.assets.open(childPath).use { it.readBytes() })
+                    }
+                }
+            }
+            feed(ASSET_ROOT)
+            val digest = md.digest().joinToString("") { "%02x".format(it) }.take(16)
+            cachedDigest = digest
+            digest
+        } catch (e: Exception) {
+            android.util.Log.w("CliManager", "计算 assets 指纹失败", e)
             null
         }
     }
@@ -144,9 +163,20 @@ object CliManager {
     /** 递归拷贝 assets/linuxdeploy-cli 到目标目录 */
     private fun extractAssets(context: Context, target: File) {
         target.mkdirs()
+        // 以 assets 为准对齐文件集合：assets 里已不存在的脚本要删掉，
+        // 否则重命名/移除组件后旧文件会残留在设备上继续被 CLI 引用。
+        val stale = mutableListOf<File>()
+        // 保留目录：CLI 运行时生成（配置、部署产物、临时文件），不属于 assets
+        val keep = setOf("config", "builds", "tmp", ".version", ".current")
         fun copyDir(path: String, dest: File) {
             val entries = context.assets.list(path) ?: return
             dest.mkdirs()
+            val names = entries.toSet()
+            dest.listFiles()?.forEach { existing ->
+                if (existing.name !in names && existing.name !in keep) {
+                    stale.add(existing)
+                }
+            }
             entries.forEach { name ->
                 val childPath = if (path.isEmpty()) name else "$path/$name"
                 val childDest = File(dest, name)
@@ -160,6 +190,7 @@ object CliManager {
             }
         }
         copyDir(ASSET_ROOT, target)
+        stale.forEach { if (!it.deleteRecursively()) it.delete() }
         // assets 解压会丢失可执行位，这里统一补回：
         // 脚本、debootstrap、pkgdetails、tools 里的静态二进制都必须可执行，
         // 否则部署时会出现 "Permission denied"（退出码 126）。

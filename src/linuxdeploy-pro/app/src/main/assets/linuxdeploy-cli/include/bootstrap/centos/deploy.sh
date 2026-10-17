@@ -25,7 +25,9 @@ fi
 
 yum_install()
 {
-    local packages="$@"
+    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
+    local packages
+    packages="$@"
     [ -n "${packages}" ] || return 1
     (set -e
         chroot_exec -u root yum install ${packages} --nogpgcheck --skip-broken -y
@@ -36,7 +38,8 @@ yum_install()
 
 yum_groupinstall()
 {
-    local groupname="$@"
+    local groupname
+    groupname="$@"
     [ -n "${groupname}" ] || return 1
     (set -e
         chroot_exec -u root yum groups install ${groupname} --nogpgcheck --skip-broken -y
