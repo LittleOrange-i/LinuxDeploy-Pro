@@ -19,8 +19,9 @@ then
 fi
 
 # 软件源，默认中科大 HTTP 镜像源
-# 注意：k30p 网络环境 https 解析不可用（实测），统一用 http；
-# 若网络对镜像存在劫持，可在配置中指定 --source-path 覆盖为其他源
+# 说明：https 源同样受支持（cli.sh 合并系统 CA 后传给 debootstrap
+# --ca-certificate，保持证书校验）；若网络对镜像存在劫持，可在配置中
+# 指定 --source-path 覆盖为其他源
 [ -n "${SOURCE_PATH}" ] || SOURCE_PATH="http://mirrors.ustc.edu.cn/debian/"
 
 # 基础安装包清单（trixie 实测通过）
@@ -109,8 +110,26 @@ do_install()
     # --extractor=ar：安卓环境缺少 dpkg-deb 时的降级解包器
     # 注意：必须以“执行”方式调用官方 debootstrap，绝不可 source（source 时 $0 变成外层 shell，save_variables 的 cp "$0" 会拿 shell 名当文件复制）
     # 输出经 log_stream 实时回显并写入日志文件
+    log_note ":: debootstrap 一阶段（下载并解包 ${SUITE}/${ARCH}）..."
+    # HTTPS 源支持：宿主 wget 不认安卓系统证书库，直接访问 https 会报
+    # "Certificate error"。这里把系统 CA 合并成 PEM 交给 debootstrap
+    # （--ca-certificate），保持证书校验而不是关闭校验。仅 https 源需要。
+    local ca_arg=""
+    case "${SOURCE_PATH}" in
+    https://*)
+        local ca_bundle
+        ca_bundle=$(env_ca_bundle)
+        if [ -n "${ca_bundle}" ]; then
+            ca_arg="--ca-certificate=${ca_bundle}"
+            log_note "   安装源为 https，已启用系统 CA 证书校验（${ca_bundle}）"
+        else
+            log_note "   [警告] 未能生成系统 CA 证书包，https 源可能因证书校验失败"
+        fi
+    ;;
+    esac
     (
-        env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
+        # shellcheck disable=SC2086
+        env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" $(env_wget_vars) "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg ${ca_arg} --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
         echo $? > "${rc_file}"
     ) | log_stream
     debootstrap_rc=$(cat "${rc_file}")

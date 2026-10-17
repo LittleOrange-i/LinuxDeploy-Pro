@@ -589,6 +589,13 @@ statx_shim_prepare()
     return 0
 }
 
+# 把参数按 POSIX 单引号规则转义，供容器内 sh -c 安全还原。
+# 用法：shell_quote "a b" → 'a b'；单引号写成 '\''
+shell_quote()
+{
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # 在 chroot 容器内执行命令
 # 用法：chroot_exec [-u 用户] 命令 [参数...]
 chroot_exec()
@@ -597,7 +604,11 @@ chroot_exec()
     unset TMP TEMP TMPDIR LD_DEBUG
     local path="${PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     local username=""
-    # 构建期 statx 兼容层注入开关：仅当部署流程把 shim 装进容器后才生效
+    # 构建期 statx 兼容层注入开关：仅当部署流程把 shim 装进容器后才生效。
+    # 注意：LD_PRELOAD 必须作用在"容器内被执行的程序"上，绝不能 export 给
+    # 宿主侧 chroot 进程本身——宿主动态链接器会去解容器内路径的库，
+    # 且 shim 依赖容器内的 libpthread，宿主上必然 "CANNOT LINK EXECUTABLE"。
+    # 因此这里改为在容器内用 sh -c 显式带上环境变量前缀。
     local shim_lib="/usr/lib/linuxdeploy/statx-shim.so"
     local shim_preload=""
     if [ -e "${CHROOT_DIR}${shim_lib}" ]; then
@@ -623,11 +634,15 @@ chroot_exec()
         fi
     else
         if [ -n "${shim_preload}" ]; then
-            # 局部变量作用域：仅在本次 chroot 调用期间设置 LD_PRELOAD
-            # 用 (subshell) 包裹确保环境变量不会污染父 shell 或其他并发调用
-            ( export LD_PRELOAD="${shim_lib}"; PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" "$@" 3>&- )
-            local rc=$?
-            return ${rc}
+            # 由容器内的 /bin/sh 解释命令串，LD_PRELOAD 只作用于其子进程。
+            # 命令参数用 "sh -c '前缀 + 原命令'" 方式传递，保持原有参数边界。
+            local cmd=""
+            local a
+            for a in "$@"; do
+                cmd="${cmd} $(shell_quote "${a}")"
+            done
+            PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" /bin/sh -c "${shim_preload}${cmd}" 3>&-
+            return $?
         fi
         # 用 "$@" 保持参数边界，避免命令串被二次解析。
         PATH="${path}" chroot ${METHOD_OPTIONS} "${CHROOT_DIR}" "$@" 3>&-
@@ -2477,6 +2492,55 @@ env_ensure_tmp()
     [ -d "${t}" ] || t="${TEMP_DIR}"
     [ -d "${t}" ] || return 0
     ln -s "${t}" /tmp 2>/dev/null || true
+}
+
+# 生成 HTTPS 用的 CA 证书包（PEM），输出路径到 stdout；失败不输出。
+# 背景：宿主 wget（GNU Wget2）不读安卓系统证书库 /system/etc/security/cacerts，
+# 直接访问 https 源会报 "Certificate error"。debootstrap 支持
+# --ca-certificate=FILE，把系统证书合并成单个 PEM 交给它即可在保持证书校验
+# 的前提下使用 https 源（而不是用 --no-check-certificate 关闭校验）。
+# 合并结果缓存在 TEMP_DIR，超过 7 天或证书目录更新时重建。
+env_ca_bundle()
+{
+    local bundle="${TEMP_DIR}/ca-bundle.pem"
+    local cacert_dir="/system/etc/security/cacerts"
+    [ -d "${cacert_dir}" ] || return 1
+    if [ -s "${bundle}" ]; then
+        # 交叉 /proc/uptime 与文件时间不可比，这里用简单时效：7 天（604800 秒）
+        local age
+        age=$(stat -c %Y "${bundle}" 2>/dev/null || echo 0)
+        if [ "${age}" -gt 0 ] 2>/dev/null; then
+            local now
+            now=$(date +%s 2>/dev/null || echo 0)
+            if [ "${now}" -gt 0 ] && [ $((now - age)) -lt 604800 ]; then
+                echo "${bundle}"
+                return 0
+            fi
+        fi
+    fi
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || return 1
+    local tmp="${bundle}.tmp.$$"
+    : > "${tmp}" 2>/dev/null || return 1
+    local f
+    for f in "${cacert_dir}"/*; do
+        [ -f "${f}" ] || continue
+        cat "${f}" >> "${tmp}" 2>/dev/null || true
+    done
+    if [ -s "${tmp}" ]; then
+        mv -f "${tmp}" "${bundle}" 2>/dev/null || { rm -f "${tmp}"; return 1; }
+        echo "${bundle}"
+        return 0
+    fi
+    rm -f "${tmp}"
+    return 1
+}
+
+# 组件脚本在子 shell 中执行，需要显式把 wget 的工作目录变量传下去：
+# wget2 会往 $HOME/.local/share/wget、$XDG_DATA_HOME/wget 写 HSTS/OCSP 缓存，
+# 变量缺失时会往根目录 "//.local/..." 写并报 Failed to open tmpfile。
+env_wget_vars()
+{
+    printf 'HOME=%s XDG_DATA_HOME=%s' "${TEMP_DIR}" "${TEMP_DIR}/xdg"
 }
 
 # 补齐宿主缺失的工具软链并加入 PATH。

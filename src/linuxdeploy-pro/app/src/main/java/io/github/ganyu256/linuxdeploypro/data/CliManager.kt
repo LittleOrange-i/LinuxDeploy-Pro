@@ -47,8 +47,13 @@ object CliManager {
      *            递归（多数 conf 无 TARGET= 行），导致 bootstrap/ubuntu、init、extra/ssh
      *            被静默丢弃、只剩 core 在跑；读取改为容错，不再中断依赖树
      * 4.1.19-r9：部署前打印 CLI 版本/脚本路径/组件目录/引导组件是否存在，
-     *            并硬校验 bootstrap/发行版 必须进入执行计划，否则直接中止并说明原因 */
-    private const val EXTRACT_MARKER = "4.1.19-r9"
+     *            并硬校验 bootstrap/发行版 必须进入执行计划，否则直接中止并说明原因
+     * 4.1.19-r10：HTTPS 源支持——合并安卓系统 CA 为 PEM 传给 debootstrap
+     *            --ca-certificate（保持证书校验，不关闭）；wget 缓存变量透传；
+     *            mksh local "$@" 兼容；debootstrap 临时文件走 TEMP_DIR；
+     *            fish 等非 main 分区包改到二阶段 apt 安装；
+     *            debootstrap scripts 符号链接实体化（APK assets 不支持链接） */
+    private const val EXTRACT_MARKER = "4.1.19-r10"
 
     /** CLI 版本（与 cli.sh 内 VERSION 对应，仅用于日志显示） */
     const val CLI_VERSION = "4.0"

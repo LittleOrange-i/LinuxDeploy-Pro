@@ -127,8 +127,25 @@ do_install()
     if [ "${TARGET_TYPE:-directory}" = "directory" ]; then
         log_note "   安装方式: 目录（${CHROOT_DIR}），源: ${SOURCE_PATH}"
     fi
+    # HTTPS 源支持：宿主 wget 不认安卓系统证书库，直接访问 https 会报
+    # "Certificate error"。这里把系统 CA 合并成 PEM 交给 debootstrap 的
+    # --ca-certificate 参数，保持证书校验而不是关闭校验。仅 https 源需要。
+    local ca_arg=""
+    case "${SOURCE_PATH}" in
+    https://*)
+        local ca_bundle
+        ca_bundle=$(env_ca_bundle)
+        if [ -n "${ca_bundle}" ]; then
+            ca_arg="--ca-certificate=${ca_bundle}"
+            log_note "   安装源为 https，已启用系统 CA 证书校验（${ca_bundle}）"
+        else
+            log_note "   [警告] 未能生成系统 CA 证书包，https 源可能因证书校验失败"
+        fi
+    ;;
+    esac
     (
-        env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
+        # shellcheck disable=SC2086
+        env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" $(env_wget_vars) "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg ${ca_arg} --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
         echo $? > "${rc_file}"
     ) | log_stream
     debootstrap_rc=$(cat "${rc_file}")

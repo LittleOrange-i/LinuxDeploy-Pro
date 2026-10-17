@@ -2447,6 +2447,51 @@ env_fix_permissions()
     chmod 755 "${INCLUDE_DIR}/bootstrap/debian/debootstrap/pkgdetails" 2>/dev/null || true
 }
 
+# 生成 HTTPS 用的 CA 证书包（PEM），输出路径到 stdout；失败不输出。
+# 背景：宿主 wget（GNU Wget2）不读安卓系统证书库 /system/etc/security/cacerts，
+# 直接访问 https 源会报 "Certificate error"。debootstrap 支持
+# --ca-certificate=FILE，把系统证书合并成单个 PEM 交给它即可在保持证书校验
+# 的前提下使用 https 源（而不是用 --no-check-certificate 关闭校验）。
+env_ca_bundle()
+{
+    local bundle="${TEMP_DIR}/ca-bundle.pem"
+    local cacert_dir="/system/etc/security/cacerts"
+    [ -d "${cacert_dir}" ] || return 1
+    if [ -s "${bundle}" ]; then
+        local age now
+        age=$(stat -c %Y "${bundle}" 2>/dev/null || echo 0)
+        now=$(date +%s 2>/dev/null || echo 0)
+        if [ "${age}" -gt 0 ] 2>/dev/null && [ "${now}" -gt 0 ] 2>/dev/null \
+            && [ $((now - age)) -lt 604800 ]; then
+            echo "${bundle}"
+            return 0
+        fi
+    fi
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || return 1
+    local tmp="${bundle}.tmp.$$"
+    : > "${tmp}" 2>/dev/null || return 1
+    local f
+    for f in "${cacert_dir}"/*; do
+        [ -f "${f}" ] || continue
+        cat "${f}" >> "${tmp}" 2>/dev/null || true
+    done
+    if [ -s "${tmp}" ]; then
+        mv -f "${tmp}" "${bundle}" 2>/dev/null || { rm -f "${tmp}"; return 1; }
+        echo "${bundle}"
+        return 0
+    fi
+    rm -f "${tmp}"
+    return 1
+}
+
+# 组件脚本在子 shell 中执行，需要显式把 wget 的工作目录变量传下去：
+# wget2 会往 $HOME/.local/share/wget、$XDG_DATA_HOME/wget 写 HSTS/OCSP 缓存，
+# 变量缺失时会往根目录 "//.local/..." 写并报 Failed to open tmpfile。
+env_wget_vars()
+{
+    printf 'HOME=%s XDG_DATA_HOME=%s' "${TEMP_DIR}" "${TEMP_DIR}/xdg"
+}
+
 # 补齐宿主缺失的工具软链并加入 PATH。
 # 安卓 toybox 没有 ar，镜像解包与 .deb 读取依赖它。
 env_init_tools()

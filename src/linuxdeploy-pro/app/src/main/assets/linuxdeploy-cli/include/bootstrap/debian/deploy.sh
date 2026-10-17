@@ -19,7 +19,7 @@ then
 fi
 
 # 软件源，默认中科大 HTTP 镜像源
-# 注意：k30p 网络环境 https 解析不可用（实测），统一用 http；
+# 说明：https 源同样受支持（cli.sh 会合并系统 CA 传给 debootstrap）；
 # 若网络对镜像存在劫持，可在配置中指定 --source-path 覆盖为其他源
 [ -n "${SOURCE_PATH}" ] || SOURCE_PATH="http://mirrors.ustc.edu.cn/debian/"
 
@@ -28,15 +28,21 @@ fi
 # - sudo：权限管理
 # - man-db：手册数据库
 # - python3：systemctl（python 实现）运行依赖
-# - fish：用户要求默认安装的 shell
-BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3,fish"
+# 注意：debootstrap 一阶段只索引 main 分区，非 main 的包（如 fish）会报
+# "E: Couldn't find these debs" 直接中断部署；这类包放到二阶段配好完整源
+# 后用 apt 安装（见 do_install）。
+BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3"
 # 排除包清单（容器内不需要 init 与 systemd 引导）
 BASE_EXCLUDE_PACKAGES="init,systemd-sysv"
+# 一阶段完成后额外安装的包（依赖非 main 分区，需先配好完整 apt 源）
+BASE_UNIVERSE_PACKAGES="fish"
 
 # apt 安装辅助函数：更新索引并静默安装指定包
 apt_install()
 {
-    local packages="$@"
+    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
+    local packages
+    packages="$@"
     [ -n "${packages}" ] || return 1
     (set -e
         log_exec chroot_exec -u root apt-get update -yq
@@ -94,7 +100,8 @@ do_install()
     # 使用官方 debootstrap（本项目内置 1.0.144）
     local DEBOOTSTRAP_DIR rc_file debootstrap_rc
     DEBOOTSTRAP_DIR="$(component_dir bootstrap/debian)/debootstrap"
-    rc_file=$(mktemp) || return 1
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    rc_file=$(mktemp "${TEMP_DIR}/ld-debootstrap.XXXXXX") || return 1
 
     # 一阶段：仅解包基础系统到目标目录
     # --no-check-gpg：跳过 Release 签名校验（离线/镜像场景必需）
@@ -102,8 +109,26 @@ do_install()
     # --extractor=ar：安卓环境缺少 dpkg-deb 时的降级解包器
     # 注意：必须以“执行”方式调用官方 debootstrap，绝不可 source（source 时 $0 变成外层 shell，save_variables 的 cp "$0" 会拿 shell 名当文件复制）
     # 输出经 log_stream 实时回显并写入日志文件
+    log_note ":: debootstrap 一阶段（下载并解包 ${SUITE}/${ARCH}）..."
+    # HTTPS 源支持：宿主 wget 不认安卓系统证书库，直接访问 https 会报
+    # "Certificate error"。这里把系统 CA 合并成 PEM 交给 debootstrap
+    # （--ca-certificate），保持证书校验而不是关闭校验。仅 https 源需要。
+    local ca_arg=""
+    case "${SOURCE_PATH}" in
+    https://*)
+        local ca_bundle
+        ca_bundle=$(env_ca_bundle)
+        if [ -n "${ca_bundle}" ]; then
+            ca_arg="--ca-certificate=${ca_bundle}"
+            log_note "   安装源为 https，已启用系统 CA 证书校验（${ca_bundle}）"
+        else
+            log_note "   [警告] 未能生成系统 CA 证书包，https 源可能因证书校验失败"
+        fi
+    ;;
+    esac
     (
-        env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
+        # shellcheck disable=SC2086
+        env DEBOOTSTRAP_DIR="${DEBOOTSTRAP_DIR}" $(env_wget_vars) "${DEBOOTSTRAP_DIR}/debootstrap" --no-check-gpg ${ca_arg} --foreign --extractor=ar --arch="${ARCH}" --exclude="${BASE_EXCLUDE_PACKAGES}" --include="${BASE_INCLUDE_PACKAGES}" "${SUITE}" "${CHROOT_DIR}" "${SOURCE_PATH}" 2>&1
         echo $? > "${rc_file}"
     ) | log_stream
     debootstrap_rc=$(cat "${rc_file}")
@@ -129,7 +154,7 @@ do_install()
 
     # 二阶段：在 chroot 内完成包配置
     unset DEBOOTSTRAP_DIR
-    rc_file=$(mktemp) || return 1
+    rc_file=$(mktemp "${TEMP_DIR}/ld-second.XXXXXX") || return 1
     (
         chroot_exec /debootstrap/debootstrap --no-check-gpg --second-stage 2>&1
         echo $? > "${rc_file}"
@@ -158,6 +183,14 @@ do_install()
     msg "正在安装 command-not-found ..."
     apt_install command-not-found
     is_ok || msg "[警告] command-not-found 安装失败（不影响容器使用）"
+
+    # 安装非 main 分区的默认包（fish）。此处在完整源配置后执行，
+    # 失败不阻断部署：基础系统已可用，shell 缺失只需手动 apt install 补装。
+    if [ -n "${BASE_UNIVERSE_PACKAGES}" ]; then
+        msg "正在安装 ${BASE_UNIVERSE_PACKAGES} ..."
+        apt_install ${BASE_UNIVERSE_PACKAGES}
+        is_ok || msg "[警告] ${BASE_UNIVERSE_PACKAGES} 安装失败（可在容器内执行 apt install 补装）"
+    fi
 
     # 安装额外软件包（可选，CLI 命令行参数仍支持）
     if [ -n "${EXTRA_PACKAGES}" ]; then
