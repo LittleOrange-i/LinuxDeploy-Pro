@@ -5,10 +5,22 @@
 do_install()
 {
     msg ":: 正在安装 ${COMPONENT} ... "
+    # 部署时 core/* 先于 bootstrap 执行（core 依赖 bootstrap 是为了让 core
+    # 排在 rootfs 安装之后，但首次部署计划里 core 子项仍可能先于引导组件被
+    # 遍历到），此时容器内还没有可用的包管理器，chroot/apt 会直接卡死。
+    # 引导阶段已把 hostname 打包进基础系统（见 bootstrap/*/deploy.sh 的
+    # BASE_INCLUDE_PACKAGES），这里仅在容器已具备包管理器时兜底补装。
+    if [ ! -x "${CHROOT_DIR}/bin/sh" ] && [ ! -x "${CHROOT_DIR}/usr/bin/sh" ]; then
+        msg "容器系统尚未安装，跳过（hostname 随引导组件一并安装）"
+        return 0
+    fi
     local packages=""
     case "${DISTRIB}:${ARCH}:${SUITE}" in
     debian:*|ubuntu:*|kali:*)
+        # Debian 系：必须真正调用安装函数，旧实现只赋值未安装，
+        # 容器内缺失 hostname 命令且无任何提示（部署日志只剩"正在配置"）
         packages="hostname"
+        apt_install ${packages}
     ;;
     archlinux:*)
         packages="hostname"

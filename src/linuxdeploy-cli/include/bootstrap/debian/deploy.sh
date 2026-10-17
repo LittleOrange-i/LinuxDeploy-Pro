@@ -29,10 +29,12 @@ fi
 # - sudo：权限管理
 # - man-db：手册数据库
 # - python3：systemctl（python 实现）运行依赖
+# - hostname：core/hostname 组件需要 hostname 命令（debootstrap 基础包不含）
+# - tzdata：时区数据库，core/timezone 需要 /usr/share/zoneinfo/<时区>
 # 注意：debootstrap 一阶段只索引 main 分区，非 main 的包（如 fish）会报
 # "E: Couldn't find these debs" 直接中断部署；这类包放到二阶段配好完整源
 # 后用 apt 安装（见 do_install）。
-BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3"
+BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3,hostname,tzdata"
 # 排除包清单（容器内不需要 init 与 systemd 引导）
 BASE_EXCLUDE_PACKAGES="init,systemd-sysv"
 # 一阶段完成后额外安装的包（依赖非 main 分区，需先配好完整 apt 源）

@@ -8,7 +8,10 @@ do_install()
     local packages=""
     case "${DISTRIB}:${ARCH}:${SUITE}" in
     debian:*|ubuntu:*|kali:*)
+        # Debian 系：必须真正调用安装函数，旧实现只赋值未安装，
+        # 容器内缺失 hostname 命令且无任何提示（部署日志只剩"正在配置"）
         packages="hostname"
+        apt_install ${packages}
     ;;
     archlinux:*)
         packages="hostname"
