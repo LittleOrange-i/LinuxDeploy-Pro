@@ -65,11 +65,20 @@ do_start()
 do_stop()
 {
     msg -n ":: 停止 ${COMPONENT} ... "
+    # 已停止（锚点不存在或进程已退出）时视为成功：重复点击停止不应报失败
+    if ! ldstatus_running; then
+        rm -f "${CHROOT_DIR}/run/ldstatus/pid" 2>/dev/null
+        remove_ldstatus_anchor
+        msg "已停止"
+        return 0
+    fi
     local ld_pid
-    ld_pid=$(cat "${CHROOT_DIR}/run/ldstatus/pid" 2>/dev/null | tr -cd '0-9')
-    [ -n "${ld_pid}" ] && kill -9 "${ld_pid}" 2>/dev/null
+    ld_pid=$(ldstatus_pid)
+    kill -9 "${ld_pid}" 2>/dev/null
     rm -f "${CHROOT_DIR}/run/ldstatus/pid"
-    is_ok "失败" "完成"
+    # 配置侧锚点同步删除，否则 status 会一直读到旧 pid 指向的复用进程
+    remove_ldstatus_anchor
+    msg "完成"
     return 0
 }
 

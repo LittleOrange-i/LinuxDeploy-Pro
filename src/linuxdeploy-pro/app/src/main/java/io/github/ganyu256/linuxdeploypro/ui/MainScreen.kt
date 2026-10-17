@@ -167,20 +167,28 @@ fun MainScreen(
     /** 刷新单个配置的真实运行状态（-c 查询，不依赖操作结果） */
     fun refreshOneConfig(name: String) {
         scope.launch {
-            val running = withContext(Dispatchers.IO) {
+            val status = withContext(Dispatchers.IO) {
                 try {
-                    CliManager.isRunning(context, name)
+                    CliManager.getStatus(context, name)
                 } catch (_: Exception) {
                     null
                 }
             }
-            if (running != null) {
+            if (status != null) {
                 val idx = configs.indexOfFirst { it.name == name }
                 if (idx >= 0) {
-                    configs[idx] = configs[idx].copy(running = running)
+                    configs[idx] = configs[idx].copy(
+                        running = status.running,
+                        sshRunning = status.sshRunning,
+                        ipv4 = status.ipv4,
+                    )
                 }
                 detailConfig = detailConfig?.takeIf { it.name == name }
-                    ?.copy(running = running)
+                    ?.copy(
+                        running = status.running,
+                        sshRunning = status.sshRunning,
+                        ipv4 = status.ipv4,
+                    )
             }
         }
     }
@@ -188,6 +196,25 @@ fun MainScreen(
     /** 静默刷新全部配置的运行状态（与启停后刷新同一路径） */
     fun refreshRunning() {
         configs.toList().forEach { refreshOneConfig(it.name) }
+        // 已停止的配置 status 也会带 IP；若仍有配置没拿到 IP（如 SSH 关闭），单独补查一次
+        if (configs.any { it.ipv4.isBlank() }) {
+            scope.launch {
+                val ip = withContext(Dispatchers.IO) {
+                    try {
+                        CliManager.hostIpv4(context)
+                    } catch (_: Exception) {
+                        ""
+                    }
+                }
+                if (ip.isNotBlank()) {
+                    for (i in configs.indices) {
+                        if (configs[i].ipv4.isBlank()) configs[i] = configs[i].copy(ipv4 = ip)
+                    }
+                    detailConfig = detailConfig?.takeIf { it.ipv4.isBlank() }?.copy(ipv4 = ip)
+                        ?: detailConfig
+                }
+            }
+        }
     }
 
     /**
@@ -203,9 +230,17 @@ fun MainScreen(
             }
         }
         if (list != null) {
-            val runningMap = configs.associate { it.name to it.running }
+            // 保留已查到的运行/ssh/IP 状态，避免刷新列表时闪回"已停止"
+            val prev = configs.associateBy { it.name }
             configs.clear()
-            configs.addAll(list.map { it.copy(running = runningMap[it.name] ?: false) })
+            configs.addAll(list.map {
+                val old = prev[it.name]
+                it.copy(
+                    running = old?.running ?: false,
+                    sshRunning = old?.sshRunning ?: false,
+                    ipv4 = old?.ipv4 ?: "",
+                )
+            })
             // 启动/刷新后逐配置刷新运行状态（与启停后刷新同一路径）
             configs.toList().forEach { refreshOneConfig(it.name) }
         }
@@ -422,21 +457,25 @@ fun MainScreen(
 
     /** 启动 / 停止容器（真实 CLI，输出进日志页） */
     fun toggleRunning(cfg: ContainerConfig) {
+        // 以列表中此刻的最新状态为准（cfg 可能是点击时捕获的旧快照：
+        // 状态刚刷新过又被点击，会按旧值决定启/停，出现"点了停止仍在运行"）
+        val latest = configs.firstOrNull { it.name == cfg.name } ?: cfg
+        val wasRunning = latest.running
         launchCliOp(
-            label = if (cfg.running) "停止 ${cfg.name}" else "启动 ${cfg.name}",
+            label = if (wasRunning) "停止 ${latest.name}" else "启动 ${latest.name}",
             op = { onLine ->
-                if (cfg.running) {
-                    CliManager.stop(context, cfg.name, onLine)
+                if (wasRunning) {
+                    CliManager.stop(context, latest.name, onLine)
                 } else {
-                    CliManager.start(context, cfg.name, onLine)
+                    CliManager.start(context, latest.name, onLine)
                 }
             },
             onSuccess = {
-                refreshOneConfig(cfg.name)
+                refreshOneConfig(latest.name)
             },
             onFailure = {
                 // 启动/停止即使部分失败也刷新真实状态（CLI start 已容错）
-                refreshOneConfig(cfg.name)
+                refreshOneConfig(latest.name)
             },
             // 兜底超时：启停正常在十秒级完成，卡住时强制终止并释放 busy
             timeoutMs = 10 * 60 * 1000L,

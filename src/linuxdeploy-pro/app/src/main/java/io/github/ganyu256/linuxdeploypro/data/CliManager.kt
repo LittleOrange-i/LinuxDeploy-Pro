@@ -559,13 +559,47 @@ object CliManager {
 
     /** 查询容器是否运行中（-c 指定配置 + status --json 的 running 字段） */
     fun isRunning(context: Context, name: String): Boolean {
+        return getStatus(context, name)?.running == true
+    }
+
+    /**
+     * 查询容器状态（-c 指定配置 + status --json）。
+     * @return null 表示 CLI 执行/解析失败（调用方应保留原状态，不要当成"已停止"）
+     */
+    fun getStatus(context: Context, name: String): ContainerStatus? {
         val json = try {
             runCliJson(context, listOf("-c", name, "--json", "status"))
+        } catch (e: Exception) {
+            android.util.Log.w("CliManager", "status 查询失败: $name: ${e.message}")
+            null
+        } ?: return null
+        return ContainerStatus(
+            running = json.optBoolean("running", false),
+            mounted = json.optBoolean("mounted", false),
+            sshEnabled = json.optBoolean("ssh_enabled", false),
+            sshRunning = json.optBoolean("ssh_running", false),
+            ipv4 = json.optString("ipv4", ""),
+        )
+    }
+
+    /** 查询宿主局域网 IPv4（CLI `ip` 命令，轻量，供列表页显示） */
+    fun hostIpv4(context: Context): String {
+        val json = try {
+            runCliJson(context, listOf("--json", "ip"))
         } catch (_: Exception) {
             null
         }
-        return json?.optBoolean("running", false) == true
+        return json?.optString("ipv4", "").orEmpty()
     }
+
+    /** 容器状态快照（status --json 的解析结果） */
+    data class ContainerStatus(
+        val running: Boolean,
+        val mounted: Boolean,
+        val sshEnabled: Boolean,
+        val sshRunning: Boolean,
+        val ipv4: String = "",
+    )
 
     /** 导出 rootfs 归档（-c 指定配置） */
     fun exportRootfs(

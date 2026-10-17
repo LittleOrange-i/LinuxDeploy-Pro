@@ -197,6 +197,7 @@ object ConfigStore {
             init = when (initRaw) {
                 "run-parts" -> "run-parts"
                 "systemctl" -> "systemctl"
+                "openrc" -> "openrc"
                 else -> "sysv"
             },
             initLevel = kv["INIT_LEVEL"] ?: "3",

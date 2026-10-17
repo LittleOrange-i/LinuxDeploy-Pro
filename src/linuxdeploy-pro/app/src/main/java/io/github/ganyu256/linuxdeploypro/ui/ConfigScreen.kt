@@ -532,25 +532,29 @@ fun ConfigScreen(
                 ),
             ) {
                 Column {
-                    // systemctl 选项仅 Debian 系列（debian/ubuntu/kali）提供
-                    val debianFamily = distro in listOf("debian", "ubuntu", "kali")
-                    val initItems = if (debianFamily) {
-                        listOf("SysV（/etc/rcN.d）", "run-parts（自定义目录）", "systemctl（init 模式）")
-                    } else {
-                        listOf("SysV（/etc/rcN.d）", "run-parts（自定义目录）")
+                    // systemctl（init 模式）依赖 python3 + systemd 风格 unit，
+                    // Debian 系（debian/ubuntu/kali）与 CentOS/Fedora 均自带；
+                    // Alpine 用 OpenRC、Arch 不保证 python3，只保留 SysV/run-parts
+                    val systemctlCapable = distro in listOf("debian", "ubuntu", "kali", "centos", "fedora")
+                    val openrcCapable = distro == "alpine"
+                    val initItems = mutableListOf("SysV（/etc/rcN.d）", "run-parts（自定义目录）")
+                    val initValues = mutableListOf("sysv", "run-parts")
+                    if (systemctlCapable) {
+                        initItems.add("systemctl（init 模式）")
+                        initValues.add("systemctl")
                     }
-                    val initValues = if (debianFamily) {
-                        listOf("sysv", "run-parts", "systemctl")
-                    } else {
-                        listOf("sysv", "run-parts")
+                    if (openrcCapable) {
+                        initItems.add("OpenRC（openrc default）")
+                        initValues.add("openrc")
                     }
-                    // 非 Debian 系列不支持 systemctl：选中态回落为 sysv
-                    val displayInit = if (initSystem == "systemctl" && !debianFamily) "sysv" else initSystem
+                    // 发行版不支持所选初始化系统时回落为 sysv
+                    val displayInit = if (initSystem in initValues) initSystem else "sysv"
                     OverlayDropdownPreference(
                         title = "初始化系统",
                         summary = when (displayInit) {
                             "run-parts" -> "run-parts（自定义脚本目录）"
                             "systemctl" -> "systemctl（init 模式，拉起 default.target 服务）"
+                            "openrc" -> "OpenRC（Alpine 默认，等价 rc-service --all）"
                             else -> "SysV（/etc/rcN.d，Debian 默认）"
                         },
                         items = initItems,
@@ -571,6 +575,25 @@ fun ConfigScreen(
                             state = initPathState,
                             hint = "目录内脚本按顺序执行 start；停止时逆序执行 stop",
                         )
+                    } else if (displayInit == "openrc") {
+                        HorizontalDivider()
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                        ) {
+                            Text(
+                                text = "OpenRC（Alpine 默认）",
+                                fontSize = 13.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceContainerVariant,
+                            )
+                            Spacer(modifier = Modifier.padding(top = 6.dp))
+                            Text(
+                                text = "启动时按 /etc/runlevels 顺序启动已启用的服务，停止时逆序停止",
+                                fontSize = 12.sp,
+                                color = MiuixTheme.colorScheme.onSurfaceContainerVariant.copy(alpha = 0.8f),
+                            )
+                        }
                     } else {
                         HorizontalDivider()
                         Column(

@@ -300,6 +300,21 @@ private fun ContainerCard(
                 maxLines = 1,
                 color = MiuixTheme.colorScheme.onSurfaceContainerVariant,
             )
+            // 局域网 IP：容器运行且开启了 SSH 时，用户可直接用这个地址连接，
+            // 不必进终端执行 ifconfig/ip addr 查询
+            if (config.ipv4.isNotBlank()) {
+                Spacer(modifier = Modifier.padding(top = 2.dp))
+                Text(
+                    text = if (config.sshEnabled) {
+                        if (config.running) "SSH 地址：${config.ipv4}:${config.sshPort}" else "局域网 IP：${config.ipv4}"
+                    } else {
+                        "局域网 IP：${config.ipv4}"
+                    },
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    color = MiuixTheme.colorScheme.primary,
+                )
+            }
         }
     }
 }

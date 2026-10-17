@@ -43,4 +43,8 @@ data class ContainerConfig(
     val initLevel: String = "3",
     val initPath: String = "/etc/rc.d",
     var running: Boolean = false,
+    /** 容器内 sshd 是否真在监听（由 CLI status 回传，用于识别"容器在跑但 ssh 没起来"） */
+    var sshRunning: Boolean = false,
+    /** 宿主局域网 IPv4（由 CLI 回传，列表页直接显示访问地址） */
+    var ipv4: String = "",
 )

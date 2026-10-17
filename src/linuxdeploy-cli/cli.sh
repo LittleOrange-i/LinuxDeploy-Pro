@@ -22,7 +22,9 @@ msg()
         shift
         echo -n "$@"
         if [ -n "${LOG_FILE}" ]; then
-            printf '%s %s' "$(date '+%F %T')" "$@" >> "${LOG_FILE}"
+            # 日志按行落盘：继续行（msg -n 后的"完成/失败"）单独成行，
+            # 避免与上一条带时间戳的记录黏在一起难以阅读
+            printf '%s %s\n' "$(date '+%F %T')" "$@" >> "${LOG_FILE}"
         fi
     else
         echo "$@"
@@ -393,6 +395,64 @@ ldstatus_pid()
         [ -n "${ld_pid}" ] && { echo "${ld_pid}"; return 0; }
     fi
     cat "${CHROOT_DIR}/run/ldstatus/pid" 2>/dev/null | tr -cd '0-9'
+}
+
+# 判断容器内 sshd 是否在监听：遍历 /proc/<pid>/root 指向容器的进程，cmdline 含 sshd。
+# 不依赖容器当前命名空间可见（容器常运行在独立 mount ns 里，本进程看不到其挂载）。
+sshd_running()
+{
+    local pid_dir pid target
+    target="${CHROOT_DIR%/}"
+    [ -n "${target}" ] || return 1
+    for pid_dir in /proc/[0-9]*
+    do
+        [ -r "${pid_dir}/cmdline" ] || continue
+        pid="${pid_dir#/proc/}"
+        [ "$(readlink "${pid_dir}/root" 2>/dev/null)" = "${target}" ] || continue
+        tr '\0' ' ' < "${pid_dir}/cmdline" 2>/dev/null | grep -q "sshd" && return 0
+    done
+    return 1
+}
+
+# 取宿主局域网 IPv4（Wi-Fi/移动网络），供前端直接显示容器访问地址。
+# 优先 ip route 的出接口地址，其次 ip addr 里的全局地址，最后 hostname -I。
+# 过滤回环、链路本地与虚拟接口（docker/veth/tun），只保留可被局域网访问的地址。
+host_ipv4()
+{
+    local ip="" iface
+    if command -v ip >/dev/null 2>&1; then
+        # 默认路由所在接口的地址最可靠（多网卡时就是当前上网那张）；
+        # 平板/热点等场景可能没有 default 路由，退化为第一条非本地网段路由的出接口
+        iface=$(ip route 2>/dev/null | awk '
+            $1=="default"{print $5; exit}
+            $1 ~ /^[0-9]+\./ { for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit} }')
+        if [ -n "${iface}" ]; then
+            ip=$(ip -4 addr show dev "${iface}" 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}')
+        fi
+        if [ -z "${ip}" ]; then
+            ip=$(ip -4 addr 2>/dev/null | awk '
+                /^[0-9]+: /{ iface=$2; sub(/:$/,"",iface) }
+                /inet /{
+                    addr=$2; sub(/\/.*/,"",addr)
+                    if (iface ~ /^(lo|docker|veth|tun|rmnet_ipa|dummy)/) next
+                    if (addr ~ /^127\./) next
+                    if (addr ~ /^169\.254\./) next
+                    print addr; exit
+                }')
+        fi
+    fi
+    if [ -z "${ip}" ] && command -v hostname >/dev/null 2>&1; then
+        ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ && !/^127\./ && !/^169\.254\./{print; exit}')
+    fi
+    printf '%s' "${ip}"
+}
+
+# 清除配置侧 ldstatus 锚点（容器已停止时调用，见 container_umount）
+remove_ldstatus_anchor()
+{
+    [ -n "${CURRENT_CONF}" ] || return 0
+    rm -f "${CONFIG_DIR}/${CURRENT_CONF}.ldstatus" 2>/dev/null
+    return 0
 }
 
 # 检查 ldstatus 标记进程是否存活：锚点 pid + 进程名校验。
@@ -1125,6 +1185,36 @@ component_is_exclude()
     return 1
 }
 
+# 展开组件名中的参数引用（如 init/${INIT}）。
+# 组件依赖解析是参数化读取、不做二次展开，DEPENDS 里写 init/${INIT} 会被当成
+# 字面目录名"init/${INIT}"而跳过——曾导致初始化系统（systemctl/sysv）从不执行。
+# 这里按当前配置参数补齐：未定义的变量剥掉一行（init/${INIT} → init），
+# 下文再按"参数指向的子组件存在则用子组件"处理。
+component_expand_name()
+{
+    local item raw var value out=""
+    for item in $*
+    do
+        raw="${item}"
+        while : ; do
+            case "${raw}" in
+            *'${'*'}'*)
+                var="${raw#*\$\{}"
+                var="${var%%\}*}"
+                value=$(eval "printf '%s' \"\${${var}}\"")
+                # 前面部分 + 变量值（未定义则为空）+ 后面部分
+                raw="$(printf '%s' "${raw%%\$\{*}")${value}$(printf '%s' "${raw#*\$\{${var}\}}")"
+            ;;
+            *) break ;;
+            esac
+        done
+        # 变量未定义时可能留下尾部斜杠（init/${INIT} → init/），去掉后即父目录
+        [ -n "${raw}" ] && [ "${raw%/}" != "${raw}" ] && raw="${raw%/}"
+        out="${out} ${raw}"
+    done
+    echo ${out}
+}
+
 # 递归解析组件依赖，按依赖顺序输出组件列表
 component_depends()
 {
@@ -1141,6 +1231,14 @@ component_depends()
     for component in ${components}
     do
         component="${component%/}"
+        # 展开参数引用（如 init/${INIT} → init/systemctl）：DEPENDS 原样解析不展开，
+        # 不处理会被当成字面目录名而静默跳过（初始化系统从不执行、本机 ssh 起不来）。
+        case "${component}" in
+        *'${'*)
+            component=$(component_expand_name "${component}")
+            [ -n "${component}" ] || continue
+        ;;
+        esac
         # 防止循环依赖
         [ -z "${IGNORE_DEPENDS##* ${component} *}" ] && continue
         IGNORE_DEPENDS="${IGNORE_DEPENDS}${component} "
@@ -1162,11 +1260,18 @@ component_depends()
         DEPENDS=$(grep '^DEPENDS=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//') || true
         # 参数化解析不会二次展开值内变量：DEPENDS 里写 ${DISTRIB} 之类
         # 会被当成字面目录名而静默跳过（历史上 bootstrap/${DISTRIB} 即栽在
-        # 这里，导致发行版引导组件从不安装）。发现残留立即提示，防回归。
-        case "${TARGET} ${DEPENDS}" in
+        # 这里，导致发行版引导组件从不安装）。这里按当前配置参数展开；
+        # 仍残留（变量未定义）时剥掉该段，降级为父目录（init/${INIT} → init）。
+        case "${DEPENDS}" in
         *'${'*)
-            msg_depends "组件 ${component} 的 TARGET/DEPENDS 含未展开变量引用（将被忽略），请在调用处显式传入"
+            DEPENDS=$(component_expand_name ${DEPENDS})
+            case "${DEPENDS}" in
+            *'${'*) DEPENDS=$(echo "${DEPENDS}" | sed -e 's#/\$[{][^}]*}##g' -e 's#[$][{][^}]*}##g') ;;
+            esac
         ;;
+        esac
+        case "${TARGET}" in
+        *'${'*) TARGET=$(component_expand_name ${TARGET}) ;;
         esac
         # 兼容性检查
         if [ "${WITHOUT_CHECK}" != "true" ]; then
@@ -1620,35 +1725,56 @@ container_umount()
     container_mounted || { msg "容器未挂载。" ; return 0; }
 
     msg -n "释放资源 ... "
-    local is_release=0
+    # 结束容器内全部进程：get_pids 按 /proc/<pid>/root 匹配容器目录，不依赖
+    # lsof（安卓普遍没有 lsof；原实现仅在 lsof 存在时取列表，于是默认什么都不杀，
+    # 容器进程一直占着挂载点，umount 连续重试也失败）。
     local pids
-    if command -v lsof >/dev/null 2>&1; then
-        pids=$(get_pids)
-    fi
+    pids=$(get_pids)
     kill_pids ${pids}; is_ok "失败" "完成"
+    # 进程已结束：清掉配置侧 ldstatus 锚点，避免 status 继续判定"运行中"
+    remove_ldstatus_anchor
 
     msg "正在卸载分区: "
     local is_mnt=0
-    local mask
-    for mask in '.*' '*'
+    # 必须按挂载层级从深到浅卸载（先 /proc、/dev/pts 等，最后容器根本身）。
+    # 按字符串倒序不够：/dev/shm 与 /dev/pts 的先后无保证；一旦先卸掉根挂载，
+    # 剩余子挂载会变成 "Invalid argument" 无法卸载，残留的 /proc /dev 让
+    # 状态判定一直为"运行中"（表现为停止后 UI 仍显示运行中）。
+    # 同一挂载点在 /proc/mounts 里可能重复出现，去重后再处理。
+    local parts=$(awk -v base="${CHROOT_DIR%/}" '$2==base || index($2, base"/")==1 {print $2}' /proc/mounts \
+        | awk '!seen[$0]++ { n=split($0, a, "/"); print n"\t"$0 }' | sort -rn | cut -f2)
+    local part
+    for part in ${parts}
     do
-        local parts=$(cat /proc/mounts | awk '{print $2}' | grep "^${CHROOT_DIR%/}/${mask}$" | sort -r)
-        local part
-        for part in ${parts}
+        local part_name=$(echo ${part} | sed "s|^${CHROOT_DIR%/}/*|/|g")
+        [ -n "${part_name}" ] || part_name="/"
+        msg -n "${part_name} ... "
+        local i
+        for i in 1 2 3
         do
-            local part_name=$(echo ${part} | sed "s|^${CHROOT_DIR%/}/*|/|g")
-            msg -n "${part_name} ... "
-            local i
-            for i in 1 2 3
-            do
-                umount ${part} && break
-                sleep 1
-            done
-            is_ok "失败" "完成"
-            is_mnt=1
+            # 用 -l 懒卸载：仍有进程占用时先脱离挂载点再回收，减少残留
+            umount -l ${part} 2>/dev/null && break
+            umount ${part} && break
+            sleep 1
         done
+        is_ok "失败" "完成"
+        is_mnt=1
     done
     [ "${is_mnt}" -eq 1 ]; is_ok " ...没有已挂载分区"
+
+    # 兜底复检：仍有残留时再循环卸载几轮（进程退出/懒卸载回收有延迟）
+    local round
+    for round in 1 2 3
+    do
+        container_mounted || break
+        grep -q "${CHROOT_DIR%/}" /proc/mounts || break
+        sleep 1
+        for part in $(awk -v base="${CHROOT_DIR%/}" '$2==base || index($2, base"/")==1 {print $2}' /proc/mounts \
+            | awk '!seen[$0]++ { n=split($0, a, "/"); print n"\t"$0 }' | sort -rn | cut -f2)
+        do
+            umount -l ${part} 2>/dev/null || true
+        done
+    done
 
     # 释放 loop 设备
     local loop
@@ -1732,12 +1858,15 @@ container_start()
 }
 
 # 停止容器：执行组件停止后自动卸载全部挂载，一步到位。
+# 与"服务器关机"对齐：停止 = 关掉容器里跑的东西 + 撤掉挂载，容器磁盘内容原样保留。
+# 因此下面两步都做尽力而为，任一步失败只告警、不阻断另一步，也不让 stop 整体失败——
+# 否则组件 do_stop 出点小错（或 init 组件按发行版参数化、模板未展开）就会"点停止没反应"。
 container_stop()
 {
     # 统一命名空间操作：锚点有效（容器运行中）一律切入容器命名空间执行 stop，
-    # 不再区分当前命名空间是否可见挂载（同命名空间切入为安全空操作）
-    if [ "${LD_NSENTER}" != "1" ] && container_nsenter_run stop "$@"; then
-        return 0
+    # 只取真正的停止结果；切入本身失败（组件报错）不提前返回。
+    if [ "${LD_NSENTER}" != "1" ]; then
+        container_nsenter_run stop "$@" && return 0
     fi
     if ! container_mounted; then
         msg "容器未挂载，无需停止。"
@@ -1745,12 +1874,18 @@ container_stop()
     fi
 
     local DO_ACTION='do_stop'
+    # 组件显式传入时按其顺序执行；默认全部组件一次执行完再卸载。
+    # ldstatus 兜底放在最后，保证容器内服务先从容退出、常驻进程最后才被强杀。
+    local rc=0
     if [ $# -gt 0 ]; then
-        component_exec "$@"
+        component_exec "$@" || rc=1
+        component_exec core/ldstatus >/dev/null 2>&1 || true
     else
-        component_exec "${INCLUDE}"
+        component_exec "${INCLUDE}" || rc=1
+        # 兜底：组件执行中途失败时 ldstatus 可能没轮到，显式补一次
+        ldstatus_running && { component_exec core/ldstatus >/dev/null 2>&1 || true; }
     fi
-    local rc=$?
+    [ ${rc} -ne 0 ] && msg "[警告] 部分组件停止失败，继续结束容器进程并卸载挂载"
 
     # 停止后自动卸载（不学原版的分步复杂化）
     if container_mounted >/dev/null 2>&1; then
@@ -1965,7 +2100,7 @@ container_status()
         local model="" android="" arch="" kernel=""
         local mem_total=0 mem_used=0 swap_total=0 swap_used=0
         local selinux=false loop=false binfmt=false mounted=false running=false
-        local installed="未知" supported_fs=""
+        local installed="未知" supported_fs="" ipv4=""
         if command -v getprop >/dev/null 2>&1; then
             model=$(getprop ro.product.model 2>/dev/null)
             android=$(getprop ro.build.version.release 2>/dev/null)
@@ -1992,6 +2127,11 @@ container_status()
         container_mounted >/dev/null 2>&1 && mounted=true
         [ "${mounted}" = "true" ] && running=true
         ldstatus_running && running=true
+        # ssh 独立判定（供前端显示/排障：容器运行但 sshd 未起时能直接看出来）
+        local ssh_enabled=false ssh_running=false
+        case " ${INCLUDE:-} " in *" extra/ssh "*) ssh_enabled=true ;; esac
+        sshd_running && ssh_running=true
+        ipv4=$(host_ipv4)
         printf '{\n'
         printf '  "model": "%s",\n' "$(json_escape "${model}")"
         printf '  "android": "%s",\n' "$(json_escape "${android}")"
@@ -2007,8 +2147,11 @@ container_status()
         printf '  "fs": "%s",\n' "$(json_escape "${supported_fs}")"
         printf '  "installed": "%s",\n' "$(json_escape "${installed}")"
         printf '  "chroot_dir": "%s",\n' "$(json_escape "${CHROOT_DIR}")"
+        printf '  "ipv4": "%s",\n' "$(json_escape "${ipv4}")"
         printf '  "mounted": %s,\n' "${mounted}"
-        printf '  "running": %s\n' "${running}"
+        printf '  "running": %s,\n' "${running}"
+        printf '  "ssh_enabled": %s,\n' "${ssh_enabled}"
+        printf '  "ssh_running": %s\n' "${ssh_running}"
         printf '}\n'
         return 0
     fi
@@ -2072,6 +2215,15 @@ container_status()
     [ "${mounted}" = "true" ] && running=true
     ldstatus_running && running=true
     [ "${running}" = "true" ] && msg "运行中" || msg "已停止"
+    msg -n "局域网 IPv4: "
+    local lan_ip=$(host_ipv4)
+    [ -n "${lan_ip}" ] && msg "${lan_ip}" || msg "未连接网络"
+    case " ${INCLUDE:-} " in
+    *" extra/ssh "*)
+        msg -n "SSH 服务: "
+        sshd_running && msg "运行中（端口 ${SSH_PORT:-22}）" || msg "未运行（本机端口不可连接）"
+    ;;
+    esac
 
     msg "组件状态: "
     local DO_ACTION='do_status'
@@ -2326,6 +2478,7 @@ helper()
 "  export <归档>                   导出 -c 指定容器为 rootfs 归档" \
 "  mount                           挂载容器" \
 "  umount                          卸载容器" \
+"  ip                              显示宿主局域网 IPv4（容器访问地址）" \
 "" \
 "常用部署参数（--key=value 形式，写入 -c 指定配置）:" \
 "  --distrib=debian|ubuntu|kali|alpine|archlinux" \
@@ -2928,11 +3081,16 @@ stop)
     set -- ${stop_args}
     IFS="${oldifs}"
     set +f
-    container_stop "$@" || exit 1
+    container_stop "$@"
+    stop_rc=$?
     if [ "${umount_flag}" = "true" ]; then
         container_umount
     fi
-    exit $?
+    if [ ${stop_rc} -ne 0 ]; then
+        # 容器已在宿主侧完成停止（进程已结束、挂载已卸）：组件报错只提示，不判失败
+        msg "[提示] 容器已停止；部分组件停止时报错（见上方日志），重新启动时会重新拉起"
+    fi
+    exit 0
 ;;
 
 restart)
@@ -3079,6 +3237,18 @@ umount)
     fi
     container_umount
     exit $?
+;;
+
+ip)
+    # 宿主局域网 IPv4（列表页展示容器访问地址；-c 可选，不触碰配置锁）
+    if [ "${JSON_MODE}" = "true" ]; then
+        printf '{\n'
+        printf '  "ipv4": "%s"\n' "$(json_escape "$(host_ipv4)")"
+        printf '}\n'
+    else
+        msg "局域网 IPv4: $(host_ipv4)"
+    fi
+    exit 0
 ;;
 
 help|-h|--help|"")

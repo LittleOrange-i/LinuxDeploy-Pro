@@ -232,6 +232,22 @@ fun ConfigDetailScreen(
                         HorizontalDivider()
                     }
                     InfoLine("状态", if (config.running) "运行中" else "已停止")
+                    if (config.ipv4.isNotBlank()) {
+                        HorizontalDivider()
+                        InfoLine("局域网 IP", config.ipv4)
+                    }
+                    if (config.sshEnabled) {
+                        HorizontalDivider()
+                        // 单独显示 sshd 实际状态：容器在跑但服务没起来时能直接看出来
+                        InfoLine(
+                            "SSH 服务",
+                            when {
+                                !config.running -> "未运行（容器已停止）"
+                                config.sshRunning -> "运行中（端口 ${config.sshPort}）"
+                                else -> "未运行（容器内 sshd 未启动）"
+                            },
+                        )
+                    }
                 }
             }
 
