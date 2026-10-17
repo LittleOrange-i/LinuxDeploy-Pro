@@ -2,13 +2,20 @@
 D=/data/data/io.github.ganyu256.linuxdeploypro/files/linuxdeploy-cli
 export TMPDIR=/data/local/tmp
 export PATH="$D/tools:$PATH"
-echo "=== wget 版本 ==="
-wget --version 2>&1 | head -2
-echo "=== 主机证书目录 ==="
-ls -ld /system/etc/security/cacerts 2>&1 | head -2
-echo "=== http 测速（Release 文件） ==="
-wget -q -O /dev/null http://mirrors.aliyun.com/ubuntu-ports/dists/jammy/Release && echo "http OK"
-echo "=== https（不加 --no-check-certificate） ==="
-wget -O /dev/null https://mirrors.aliyun.com/ubuntu-ports/dists/jammy/Release 2>&1 | tail -3
-echo "=== https + --no-check-certificate ==="
-wget -q --no-check-certificate -O /dev/null https://mirrors.aliyun.com/ubuntu-ports/dists/jammy/Release && echo "https(nocheck) OK"
+try() {
+    name="$1"; url="$2"
+    s=$(date +%s)
+    if wget -q --no-check-certificate -T 20 -O /dev/null "$url" 2>/dev/null; then
+        e=$(date +%s)
+        echo "$name: OK $((e-s))s"
+    else
+        e=$(date +%s)
+        echo "$name: FAIL $((e-s))s"
+    fi
+}
+# 约 1MB 的包索引做速度参考
+try "aliyun-http " "http://mirrors.aliyun.com/ubuntu-ports/dists/jammy/main/binary-arm64/Packages.gz"
+try "aliyun-https" "https://mirrors.aliyun.com/ubuntu-ports/dists/jammy/main/binary-arm64/Packages.gz"
+try "ustc-https  " "https://mirrors.ustc.edu.cn/ubuntu-ports/dists/jammy/main/binary-arm64/Packages.gz"
+try "tuna-https  " "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports/dists/jammy/main/binary-arm64/Packages.gz"
+try "huawei-https" "https://repo.huaweicloud.com/ubuntu-ports/dists/jammy/main/binary-arm64/Packages.gz"
