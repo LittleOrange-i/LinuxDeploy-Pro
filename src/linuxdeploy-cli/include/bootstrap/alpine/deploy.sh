@@ -39,19 +39,40 @@ apk_branch()
     esac
 }
 
+# wget 附加参数（供获取 rootfs 归档的几处 wget 复用）。两个平台性原因：
+# 1) 宿主内置 wget 是 GNU Wget2，不读安卓系统证书库
+#    /system/etc/security/cacerts，直接访问 https 源会报 “Certificate error”
+#    （wget 退出码 5），表现为“正在获取 rootfs 归档 ... 失败”；
+#    这里复用 cli.sh 的 env_ca_bundle 生成 PEM 证书包，用 --ca-certificate 传入，
+#    保持证书校验而不是关闭校验（与 archlinux/debian 组件同一做法）；
+# 2) 部分镜像站（如清华 TUNA）的 nginx 防护会拦截 Wget2 默认 UA 返回 403，
+#    统一改用通用 wget UA（实测换 UA 即 200）。
+apk_wget_opts()
+{
+    local opts="-U Wget/1.21.3"
+    case "${SOURCE_PATH}" in
+    https://*)
+        local ca_bundle
+        ca_bundle=$(env_ca_bundle)
+        [ -n "${ca_bundle}" ] && opts="${opts} --ca-certificate=${ca_bundle}"
+        ;;
+    esac
+    echo "${opts}"
+}
+
 # rootfs 归档名：优先读 latest-releases.yaml；
 # 镜像站未同步该文件或格式变化时，回退为目录列表匹配（不依赖文件内的字段顺序）。
 apk_rootfs_name()
 {
     local branch="$1" name=""
-    name=$(wget -q -O - "${branch}/releases/${ARCH}/latest-releases.yaml" 2>/dev/null \
+    name=$(wget $(apk_wget_opts) -q -O - "${branch}/releases/${ARCH}/latest-releases.yaml" 2>/dev/null \
         | grep -m1 "file: alpine-minirootfs" | awk '{print $2}' | tr -d '"' | tr -d "'")
     if [ -z "${name}" ]; then
         # 回退：抓目录索引，取最新的 alpine-minirootfs-<版本>-<arch>.tar.gz。
         # 注意：Android toybox 的 sort 不支持 -V（会报 invalid option），
         # 这里按“主/次/修订版本号数值”比较，保证设备上同样可用。
         local ver f a b
-        for f in $(wget -q -O - "${branch}/releases/${ARCH}/" 2>/dev/null \
+        for f in $(wget $(apk_wget_opts) -q -O - "${branch}/releases/${ARCH}/" 2>/dev/null \
             | grep -o "alpine-minirootfs-[0-9][0-9.]*-${ARCH}\.tar\.gz" | sort -u)
         do
             # 从文件名截出版本号：alpine-minirootfs-3.22.6-aarch64.tar.gz → 3.22.6
@@ -112,7 +133,7 @@ do_install()
     fi
     msg "完成（${rootfs_name}）"
     mkdir -p "${CHROOT_DIR}"
-    if ! wget -q -O - "${branch}/releases/${ARCH}/${rootfs_name}" | tar xz -C "${CHROOT_DIR}" 2>/dev/null; then
+    if ! wget $(apk_wget_opts) -q -O - "${branch}/releases/${ARCH}/${rootfs_name}" | tar xz -C "${CHROOT_DIR}" 2>/dev/null; then
         msg "[错误] Alpine rootfs 下载或解包失败（${branch}/releases/${ARCH}/${rootfs_name}）"
         return 1
     fi

@@ -3454,7 +3454,13 @@ esac
         if ! find "${CHROOT_DIR}/lib" "${CHROOT_DIR}/usr/lib" -maxdepth 2 \( -name "ld-linux-*.so*" -o -name "ld-musl-*.so*" \) 2>/dev/null | grep -q .; then
             deploy_miss=" 动态链接器(ld-linux/ld-musl)"
         fi
-        [ -e "${CHROOT_DIR}/bin/sh" ] || deploy_miss="${deploy_miss} /bin/sh"
+        # /bin/sh 在部分发行版里是容器内的绝对符号链接（如 Alpine 的
+        # /bin/sh -> /bin/busybox），从宿主侧按 CHROOT_DIR 前缀做 -e 判断时，
+        # 绝对目标会被解析到宿主根目录从而误判为“不存在”，导致明明部署成功
+        # 却报“容器系统文件不完整（缺少: /bin/sh）”。这里同时认可符号链接本身。
+        if [ ! -e "${CHROOT_DIR}/bin/sh" ] && [ ! -L "${CHROOT_DIR}/bin/sh" ]; then
+            deploy_miss="${deploy_miss} /bin/sh"
+        fi
         if [ -n "${deploy_miss}" ]; then
             msg "[错误] 容器系统文件不完整（缺少:${deploy_miss}），部署未真正完成。"
             # 目录里连 debootstrap 工作目录都没有：一阶段没走完（下载/解包前就退了），
