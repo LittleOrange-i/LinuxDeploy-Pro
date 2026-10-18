@@ -100,15 +100,43 @@ do_install()
     mkdir -p "${cache_dir}"
     is_ok "失败" "完成" || return 1
 
+    # HTTPS 源支持：宿主内置 wget（GNU Wget2）不读安卓系统证书库
+    # /system/etc/security/cacerts，直接访问 https 源会报
+    # "The certificate is NOT trusted / Certificate error"（wget 退出码 5），
+    # 部署卡在“正在获取软件包列表”阶段。这里复用 cli.sh 的 env_ca_bundle
+    # 把系统证书合并成单个 PEM，用 --ca-certificate 交给 wget，保持证书校验
+    # 而不是关闭校验（与 debian/ubuntu 组件的处理方式一致）。
+    local ca_arg=""
+    case "${SOURCE_PATH}" in
+    https://*)
+        local ca_bundle
+        ca_bundle=$(env_ca_bundle)
+        [ -n "${ca_bundle}" ] && ca_arg="--ca-certificate=${ca_bundle}"
+        ;;
+    esac
+    # 部分镜像站的 nginx 防护会拦截 Wget2 默认 UA 并返回 403（wget 仍以 0
+    # 退出且不落盘文件，只表现为“索引/软件包下载为空”）。清华 TUNA 实测：
+    # 默认 UA 403，换成通用 wget UA 即 200。这里统一使用通用 UA 规避误伤。
+    local wget_ua="Wget/1.21.3"
+
     msg -n "正在获取软件包列表 ... "
-    # 下载软件包索引（core.db.tar.gz），失败时明确报错，
+    # 下载软件包索引，失败时明确报错，
     # 避免后续管道在空数据上“成功”退出而掩盖问题。
-    local db_file="${cache_dir}/core.db.tar.gz"
+    # 索引文件名优先用 core.db：ALARM 镜像只提供 core.db（无 .db.tar.gz），
+    # 且部分镜像站（如清华 TUNA）对 core.db.tar.gz 直接返回 403。
+    # 两者内容等价（均为 gzip 压缩的包数据库），core.db 通用性最好。
+    local db_file="${cache_dir}/core.db"
     local wget_err="${cache_dir}/wget.err"
     rm -f "${wget_err}"
     local wget_rc
-    wget -q -T 60 -O "${db_file}" "${repo_url}/core.db.tar.gz" 2>"${wget_err}"
+    wget -q -T 60 -U "${wget_ua}" ${ca_arg} -O "${db_file}" "${repo_url}/core.db" 2>"${wget_err}"
     wget_rc=$?
+    if [ "${wget_rc}" -ne 0 ] || [ ! -s "${db_file}" ]; then
+        # 兜底：个别镜像只保留了 core.db.tar.gz
+        rm -f "${db_file}"
+        wget -q -T 60 -U "${wget_ua}" ${ca_arg} -O "${db_file}" "${repo_url}/core.db.tar.gz" 2>>"${wget_err}"
+        wget_rc=$?
+    fi
     if [ "${wget_rc}" -ne 0 ]; then
         msg "下载软件包索引失败（退出码 ${wget_rc}）"
         if [ -s "${wget_err}" ]; then
@@ -124,7 +152,10 @@ do_install()
     fi
     # 部分镜像站（如中科大 USTC）对索引/db 文件返回 403 错误页，
     # wget 可能仍以 0 退出，下载到的是 HTML 而非 gzip。校验真实内容。
-    if command -v gzip >/dev/null 2>&1 && ! gzip -t "${db_file}" 2>/dev/null; then
+    # 注意：安卓自带 gzip 是 toybox 实现，没有 -t（仅支持 -cdfk 等），
+    # `gzip -t` 会直接报 “Unknown option 't'”，使校验恒为失败——
+    # 因此改用通用的解压到 /dev/null 来判定 gzip 流是否有效。
+    if command -v gzip >/dev/null 2>&1 && ! gzip -dc "${db_file}" >/dev/null 2>&1; then
         # 诊断输出：打印实际下载内容的大小与开头，便于定位
         # （403 错误页 / wget 异常 / 网络污染 / 空文件）。
         local db_size db_head
@@ -146,7 +177,12 @@ do_install()
         msg "软件包索引解包失败，请更换镜像源"
         return 1
     fi
-    local core_files=$(find "${db_dir}" -type f -name desc \
+    # 注意：必须“先声明再赋值”。写成 local core_files=$(...) 时，命令替换
+    # 的结果会被字段分割，再交给 local/typeset 当变量名解析，Android 的
+    # mksh 会直接报 “typeset: xxx.pkg.tar.xz: is not an identifier” 并只保留
+    # 第一个包名，导致后续只下载到一个包、pacman 同步失败、部署中途夭折。
+    local core_files
+    core_files=$(find "${db_dir}" -type f -name desc \
         -exec grep -A1 '^%FILENAME%$' {} \; 2>/dev/null | \
         grep -v -e '^%FILENAME%$' -e '^--$' -e '^$' | \
         grep -v -e '^linux-' -e '^grub-' -e '^efibootmgr-' -e '^openssh-' \
@@ -163,7 +199,8 @@ do_install()
     msg "正在获取软件包: "
     # filesystem 软件包需最先解包（提供基础目录结构）。
     # 注意保持多行匹配，避免换行被展开成空格后无法命中行首。
-    local fs_file=$(printf '%s\n' ${core_files} | grep -m1 '^filesystem-')
+    local fs_file
+    fs_file=$(printf '%s\n' ${core_files} | grep -m1 '^filesystem-')
     for pkg_file in ${fs_file} ${core_files}
     do
         msg -n "${pkg_file%-*} ... "
@@ -171,7 +208,7 @@ do_install()
         local i
         for i in 1 2 3
         do
-            wget -q -c -T 60 -O "${cache_dir}/${pkg_file}" "${repo_url}/${pkg_file}" && break
+            wget -q -c -T 60 -U "${wget_ua}" ${ca_arg} -O "${cache_dir}/${pkg_file}" "${repo_url}/${pkg_file}" && break
             sleep 5s
         done
         # unpack：
