@@ -127,13 +127,13 @@ fun SettingsScreen(
                 Column {
                     ArrowPreference(
                         title = "作者",
-                        summary = "Ganyu256",
-                        onClick = { openUrl(context, "https://github.com/Ganyu256") },
+                        summary = "GanYu256",
+                        onClick = { openUrl(context, "https://github.com/GanYu256") },
                     )
                     ArrowPreference(
                         title = "开源地址",
-                        summary = "GitHub 仓库",
-                        onClick = { openUrl(context, "https://github.com/Ganyu256/Linuxdeploy-Pro") },
+                        summary = "github.com/GanYu256/LinuxDeploy-Pro",
+                        onClick = { openUrl(context, "https://github.com/GanYu256/LinuxDeploy-Pro") },
                     )
                     AboutInfoLine("版本", "v${BuildConfig.VERSION_NAME}")
                     AboutInfoLine("包名", "io.github.ganyu256.linuxdeploypro")

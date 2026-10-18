@@ -1,7 +1,5 @@
 package io.github.ganyu256.linuxdeploypro.ui
 
-import io.github.ganyu256.linuxdeploypro.BuildConfig
-
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -51,6 +49,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.ganyu256.linuxdeploypro.data.CliManager
 import io.github.ganyu256.linuxdeploypro.data.ConfigStore
+import io.github.ganyu256.linuxdeploypro.data.OpLogHub
 import io.github.ganyu256.linuxdeploypro.data.KeepAliveService
 import io.github.ganyu256.linuxdeploypro.model.ContainerConfig
 import io.github.ganyu256.linuxdeploypro.ui.theme.ThemeMode
@@ -95,26 +94,22 @@ fun MainScreen(
     var detailConfig by remember { mutableStateOf<ContainerConfig?>(null) }
     // 导入 rootfs 的目标配置（SAF 文件选择回调里使用）
     var importTarget by remember { mutableStateOf<ContainerConfig?>(null) }
-    val logs = rememberSaveable(saver = LogListSaver) {
-        mutableStateListOf("v${BuildConfig.VERSION_NAME} 启动，CLI 后端已接入")
-    }
-    // 最新 CLI 操作日志文件（每次操作一个独立时间戳文件），供日志页尾随展示
-    var logFile by remember { mutableStateOf<File?>(null) }
-    // 日志页刷新信号：操作结束时 +1，让日志页兜底重读一次日志文件
-    var logRefreshTick by remember { mutableIntStateOf(0) }
+    // 日志与长任务运行态上移到进程级 OpLogHub（详见其注释）：
+    // 切换 tab/子页面不再销毁日志尾随，Activity 重建（主题切换等）不再丢日志、
+    // 不再中断部署协程——此前部署中切页回来，日志页要从文件头逐段重读数 MB，
+    // 长时间看不到最新进度（表现为"日志丢失"）。
+    val logs = OpLogHub.logs
+    var logFile by OpLogHub::logFile
     var tab by rememberSaveable { mutableIntStateOf(0) }
     // 路由栈：栈顶即当前页面，返回键弹栈，实现层级逐步返回
     val routeStack = rememberSaveable(saver = RouteListSaver) {
         mutableStateListOf("main")
     }
-    // 操作锁：同一时间只允许一个 CLI 长任务（启停/部署/导出/删除/保存）
-    var busy by remember { mutableStateOf(false) }
-    // busy 开始时间（自动恢复兜底：异常挂起超过时限强制解除，避免永久卡死）
-    var busySince by remember { mutableStateOf(0L) }
-    // 当前进行中的长任务文案（null=空闲）；顶部横幅显示进度，结束自动清除
-    var opLabel by remember { mutableStateOf<String?>(null) }
-    // 正在部署的配置名（容器页徽标显示"部署中"；结束清除）
-    var deployingName by remember { mutableStateOf<String?>(null) }
+    // 操作锁/进行中文案/部署徽标：进程级持有，旋转/重建后 UI 状态保持一致
+    var busy by OpLogHub::busy
+    var busySince by OpLogHub::busySince
+    var opLabel by OpLogHub::opLabel
+    var deployingName by OpLogHub::deployingName
     // 新建配置保存成功后待引导部署的配置（触发"立即部署？"对话框）
     var pendingDeployConfig by remember { mutableStateOf<ContainerConfig?>(null) }
     // 待确认删除的配置名（触发删除确认对话框，替代 CLI stdin 确认）
@@ -153,16 +148,11 @@ fun MainScreen(
     }
 
     /**
-     * 追加一条日志（带时间戳）。
-     * 注意：只在主线程调用（CLI 行回调里已通过 withContext(Main) 切回）。
+     * 追加一条日志（带时间戳，实际写入 OpLogHub 进程级缓冲）。
+     * 注意：只在主线程调用（CLI 行回调里已通过协程切回主线程）。
      * 4.0.2 起日志按时间正序排列（旧日志在上，新日志追加到末尾）。
      */
-    val appendLog: (String) -> Unit = { msg ->
-        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
-            .format(java.util.Date())
-        logs.add("$time  $msg")
-        if (logs.size > 500) logs.removeAt(0)
-    }
+    val appendLog: (String) -> Unit = { msg -> OpLogHub.append(msg) }
 
     /** 刷新单个配置的真实运行状态（-c 查询，不依赖操作结果） */
     fun refreshOneConfig(name: String) {
@@ -285,7 +275,10 @@ fun MainScreen(
         } catch (_: Exception) {
             // 部分 ROM 限制后台启动前台服务，失败仅降级（任务仍执行）
         }
-        scope.launch {
+        // 长任务跑在进程级 opScope：MainScreen 因主题切换/Activity 重建离开组合时，
+        // 部署协程不被取消，日志继续流入 OpLogHub（此前挂在 rememberCoroutineScope
+        // 上，重建即取消，部署中断、日志断流）。
+        OpLogHub.opScope.launch {
             var ok = false
             var error: String? = null
             var timedOut = false
@@ -295,12 +288,12 @@ fun MainScreen(
                         withContext(Dispatchers.IO) {
                             ok = op { line ->
                                 // 回调非挂起上下文，这里另起主线程协程追加日志
-                                scope.launch(Dispatchers.Main.immediate) {
+                                OpLogHub.opScope.launch {
                                     appendLog(line)
                                     // 从 CLI 输出中捕获日志文件路径，日志页据此尾随展示
                                     val prefix = "日志文件: "
                                     if (line.startsWith(prefix)) {
-                                        logFile = File(line.substring(prefix.length).trim())
+                                        OpLogHub.attachLogFile(File(line.substring(prefix.length).trim()))
                                     }
                                 }
                             }
@@ -315,11 +308,11 @@ fun MainScreen(
                 } else {
                     withContext(Dispatchers.IO) {
                         ok = op { line ->
-                            scope.launch(Dispatchers.Main.immediate) {
+                            OpLogHub.opScope.launch {
                                 appendLog(line)
                                 val prefix = "日志文件: "
                                 if (line.startsWith(prefix)) {
-                                    logFile = File(line.substring(prefix.length).trim())
+                                    OpLogHub.attachLogFile(File(line.substring(prefix.length).trim()))
                                 }
                             }
                         }
@@ -351,8 +344,7 @@ fun MainScreen(
                         onFailure()
                     }
                 }
-                // 操作结束：通知日志页兜底重读一次，保证窗口内容与磁盘日志一致
-                logRefreshTick++
+                // 操作结束：日志尾随为进程级常驻，增量已在持续读取，无需额外兜底信号
                 busy = false
                 busySince = 0L
                 opLabel = null
@@ -422,7 +414,9 @@ fun MainScreen(
         }
         val isNew = selfIndex < 0
         busy = true
-        scope.launch {
+        // 保存同样走进程级 opScope：busy 已是进程级状态，
+        // 若协程还挂在组合作用域，Activity 重建后 busy 残留互斥卡死
+        OpLogHub.opScope.launch {
             var result: CliManager.CliResult? = null
             var error: String? = null
             var resizeApplied = false
@@ -442,7 +436,7 @@ fun MainScreen(
                         val imageFile = File("${cfg.path}.img")
                         if (imageFile.exists()) {
                             val ok = CliManager.resize(context, cfg.name, cfg.imageSize) { line ->
-                                scope.launch(Dispatchers.Main.immediate) { appendLog(line) }
+                                OpLogHub.opScope.launch { appendLog(line) }
                             }
                             if (ok) resizeApplied = true else resizeFailed = true
                         } else {
@@ -926,14 +920,13 @@ fun MainScreen(
                 onToggleAutostart = ::toggleAutostart,
                 logs = logs,
                 logFile = logFile,
-                logRefreshTick = logRefreshTick,
                 onNewConfig = { pushRoute("new") },
                 onOpenConfig = { openDetail(it.name) },
                 onToggleRunning = { toggleRunning(it) },
                 onEditConfig = { openEdit(it.name) },
                 onOpenSettings = { pushRoute("settings") },
                 onClearLogs = {
-                    logs.clear()
+                    OpLogHub.clearDisplay()
                     appendLog("日志已清空")
                 },
                 opLabel = opLabel,
@@ -1121,12 +1114,6 @@ private fun ContainerConfig.withRuntimeStateFrom(list: List<ContainerConfig>): C
     return copy(running = live.running, sshRunning = live.sshRunning, ipv4 = live.ipv4)
 }
 
-/** 日志列表保存器：进程重建后仍保留（String 行，无需结构解析） */
-private val LogListSaver = listSaver<MutableList<String>, String>(
-    save = { it.toList() },
-    restore = { it.toMutableStateList() },
-)
-
 /** 路由栈保存器：进程重建后仍保留当前页面 */
 private val RouteListSaver = listSaver<MutableList<String>, String>(
     save = { it.toList() },
@@ -1147,7 +1134,6 @@ private fun MainTabScreen(
     onToggleAutostart: (ContainerConfig) -> Unit,
     logs: List<String>,
     logFile: File?,
-    logRefreshTick: Int,
     onNewConfig: () -> Unit,
     onOpenConfig: (ContainerConfig) -> Unit,
     onToggleRunning: (ContainerConfig) -> Unit,
@@ -1251,8 +1237,8 @@ private fun MainTabScreen(
 
                 else -> LogScreen(
                     logs = logs,
+                    fileLines = OpLogHub.fileLines,
                     logFile = logFile,
-                    refreshTick = logRefreshTick,
                     onClear = onClearLogs,
                 )
             }

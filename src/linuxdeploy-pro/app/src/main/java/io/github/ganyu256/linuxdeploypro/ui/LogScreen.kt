@@ -24,7 +24,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -35,12 +34,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.io.ByteArrayOutputStream
-import java.io.RandomAccessFile
-import java.nio.ByteBuffer
-import java.nio.charset.CharacterCodingException
-import java.nio.charset.CodingErrorAction
-import kotlinx.coroutines.delay
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -51,60 +44,25 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * 顶部提供“复制全部”与“清空”。日志按时间正序排列
  * （旧在上、新在下），新日志到达时自动滚动到底部。
  *
- * 4.0.4 起优先尾随 CLI 的日志文件（每次操作一个独立时间戳文件）：
- * 轮询增量读取，旧在上新在下，跨行可复制；没有可用日志文件时
- * 回退显示内存会话日志（如启动提示、保存配置等短消息）。
+ * 4.0.4 起优先尾随 CLI 的日志文件（每次操作一个独立时间戳文件），
+ * 没有可用日志文件时回退显示内存会话日志（如启动提示、保存配置等短消息）。
+ *
+ * 4.1.21 起文件尾随协程与缓冲上移到进程级 OpLogHub（本组件变为纯展示）：
+ * 切换 tab / 子页面不再取消尾随、清空缓冲——此前回到日志页要按
+ * 64KB/500ms 从文件头逐段重读，部署日志达数 MB 时恢复需数十秒，
+ * 表现为"切页回来日志丢失"。
  */
 @Composable
 fun LogScreen(
     logs: List<String>,
+    fileLines: List<String>,
     logFile: java.io.File?,
-    refreshTick: Int,
     onClear: () -> Unit,
 ) {
     val context = LocalContext.current
     // 剪贴板：LocalClipboardManager 已弃用，改用系统 ClipboardManager
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
     val scrollState = rememberScrollState()
-    // 从日志文件读出的完整行（旧在上、新在下）
-    val fileLines = remember { mutableStateListOf<String>() }
-
-    // 尾随日志文件：500ms 轮询增量读取。
-    // 文件路径变化（新操作）或 refreshTick 变化（操作结束兜底刷新）时，
-    // 从文件开头整体重读，保证窗口内容与磁盘日志一致。
-    LaunchedEffect(logFile?.absolutePath, refreshTick) {
-        fileLines.clear()
-        val f = logFile ?: return@LaunchedEffect
-        var offset = 0L
-        val pending = ByteArrayOutputStream()
-        while (true) {
-            if (f.exists()) {
-                try {
-                    val len = f.length()
-                    if (len < offset) {
-                        // 文件被替换/截断：整体重读
-                        offset = 0L
-                        pending.reset()
-                        fileLines.clear()
-                    }
-                    if (len > offset) {
-                        val chunk = ByteArray((len - offset).toInt().coerceAtMost(64 * 1024))
-                        val read = RandomAccessFile(f, "r").use { raf ->
-                            raf.seek(offset)
-                            raf.read(chunk)
-                        }
-                        if (read > 0) {
-                            offset += read
-                            fileLines.addAll(decodeUtf8Lines(pending, chunk.copyOf(read)))
-                        }
-                    }
-                } catch (_: Exception) {
-                    // 文件写入过程中短暂不可读（如刚创建/被占用），下一轮重试
-                }
-            }
-            delay(500)
-        }
-    }
 
     // 有日志文件优先显示文件内容，否则显示会话日志
     val showingFile = logFile != null
@@ -169,10 +127,7 @@ fun LogScreen(
                 WindowAction(
                     text = "清空",
                     color = MiuixTheme.colorScheme.onSurfaceContainerVariant,
-                    onClick = {
-                        fileLines.clear()
-                        onClear()
-                    },
+                    onClick = onClear,
                 )
             }
             // 标题栏分隔线
@@ -232,48 +187,6 @@ private fun logLineColor(line: String): Color {
         line.contains("警告") -> Color(0xFFE3B341)
         else -> Color(0xFF7EE787)
     }
-}
-
-/**
- * 增量解码 UTF-8 字节流为完整行列表。
- *
- * 轮询读取可能把一行拆到两次读取中间，末尾的不完整多字节序列需要
- * 保留到下一轮继续拼接（否则中文日志会出现乱码/断行）。
- *
- * @param pending 上一轮残留的不完整字节
- * @param chunk   本轮新读到的字节
- * @return 本轮可展示的完整行（以换行符结尾的部分）
- */
-private fun decodeUtf8Lines(pending: ByteArrayOutputStream, chunk: ByteArray): List<String> {
-    pending.write(chunk)
-    val bytes = pending.toByteArray()
-    // 末尾最多可能是 3 字节的不完整 UTF-8 序列；从 0 到 3 逐字节试探截断，
-    // 找到能完整解码的最大前缀，剩下的字节留在 pending 里下一轮拼接。
-    for (cut in 0..3) {
-        if (cut > bytes.size) break
-        try {
-            val decoder = Charsets.UTF_8.newDecoder()
-                .onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT)
-            val text = decoder.decode(ByteBuffer.wrap(bytes, 0, bytes.size - cut)).toString()
-            pending.reset()
-            if (cut > 0) pending.write(bytes, bytes.size - cut, cut)
-            val lines = text.split("\n")
-            if (lines.isNotEmpty() && lines.last().isEmpty()) {
-                // 末尾是换行符：没有未完成行
-                return lines.dropLast(1)
-            }
-            // 最后一段是不完整行，放回 pending 下一轮拼接
-            pending.reset()
-            pending.write(lines.last().toByteArray(Charsets.UTF_8))
-            return lines.dropLast(1)
-        } catch (_: CharacterCodingException) {
-            // 截断后仍无法解码，继续增加截断长度
-        }
-    }
-    // 全部无法解码（异常字节流）：丢弃，避免 pending 无限增长
-    pending.reset()
-    return emptyList()
 }
 
 /** 窗口标题栏里的装饰圆点 */
