@@ -138,6 +138,22 @@ ssh_listening()
     return 1
 }
 
+# 指定端口是否已被监听（宿主与容器共享网络命名空间，/proc/net/tcp 即宿主全局视图）。
+# 用途：多容器场景下端口被"别的容器"占用时，本容器 sshd 无法绑定，
+# 而用户 ssh 却会连到占用该端口的那个容器上（现象：能登录但环境/密码不对）。
+ssh_port_in_use()
+{
+    local port_hex
+    port_hex=$(printf '%04X' "${SSH_PORT:-22}" 2>/dev/null)
+    [ -n "${port_hex}" ] || return 1
+    local f
+    for f in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "${f}" ] || continue
+        awk -v p=":${port_hex}" '$4=="0A" && $2 ~ p"$" {found=1; exit} END{exit !found}' "${f}" && return 0
+    done
+    return 1
+}
+
 do_install()
 {
     msg ":: 正在安装 ${COMPONENT} ... "
@@ -220,6 +236,16 @@ do_start()
     if sshd_running; then
         msg "跳过（sshd 已在运行）"
         return 0
+    fi
+    # 端口占用检查（多容器场景）：所有容器共享宿主网络命名空间，
+    # 端口被"其它容器或宿主服务"占用时本容器 sshd 无法绑定，而用户 ssh
+    # 会连到占用该端口的那个容器上（现象：能登录但环境/密码不对）。
+    # 这里提前明确告警，避免用户误以为"本容器 SSH 正常"。
+    if ssh_port_in_use; then
+        msg "端口冲突"
+        msg "[警告] SSH 端口 ${SSH_PORT} 已被监听（可能是其它容器或宿主服务）"
+        msg "        本容器 sshd 无法绑定该端口；请到配置页把本容器端口改成其它值后重新启动"
+        msg "        （每个容器必须使用不同端口，避免连到别的容器）"
     fi
     # OpenRC 容器：交给 rc-service 启动（能正确管理 pid 与依赖），不直接裸起 sshd
     if [ "${INIT}" = "openrc" ] && [ -x "${CHROOT_DIR}/etc/init.d/sshd" ]; then

@@ -107,7 +107,7 @@ do_install()
 
     msg ":: 正在安装 ${COMPONENT} ... "
 
-    local root prefix repo_url pkg_list
+    local root prefix repo_url pkg_list pkg_list_raw
     root=$(slack_repo_root)
     prefix=$(slack_pkg_prefix)
     repo_url="${root}/${prefix}"
@@ -129,14 +129,21 @@ do_install()
 
     msg -n "正在获取软件包列表 ... "
     # FILE_LIST 在仓库子目录（slackware/ 或 slackware64/）下，不在 FTP 根目录。
-    # 解析出包相对路径（形如 ./a/bash-5.3.020-aarch64-1.txz）。
+    # 注意：该文件是 `ls -lR` 风格的目录清单，包路径位于行尾而不是行首，形如
+    #   -rw-r--r--  1 root root 54364 2026-09-06 20:44 ./a/aaa_terminfo-6.6-aarch64-2.txz
+    # 旧实现按“行首就是相对路径”解析，永远匹配不到任何包，表现为
+    # “正在解析基础软件包”直接失败（提示镜像不完整）。
+    # 这里先规范化清单：只取 .txz 行的路径字段（保留 ./ 前缀），
+    # 后续 grep/sed 仍按原格式（^\./a/<包名>-）工作，无需改动其他逻辑。
+    pkg_list_raw="${cache_dir}/FILE_LIST"
     pkg_list="${cache_dir}/packages.list"
-    if ! wget -q -T 60 -O "${pkg_list}" "${repo_url}/FILE_LIST"; then
+    if ! wget -q -T 60 -O "${pkg_list_raw}" "${repo_url}/FILE_LIST"; then
         msg "失败"
         msg "[提示] 无法下载软件包清单：${repo_url}/FILE_LIST"
         msg "        请确认软件源指向 Slackware 镜像根（aarch64 仅提供 slackwareaarch64-current）。"
         return 1
     fi
+    sed -n 's|^.*[[:space:]]\(\./[^[:space:]]*\.txz\)$|\1|p' "${pkg_list_raw}" > "${pkg_list}"
     if ! grep -q '\.txz$' "${pkg_list}" 2>/dev/null; then
         msg "失败"
         msg "[提示] 软件包清单无效（${repo_url}/FILE_LIST 中未解析到 .txz 包）"
@@ -210,11 +217,33 @@ do_install()
         #   - /etc/shadow 未生成 → core/profile 报“容器内缺少 /etc/shadow”并中止部署；
         #   - ldconfig 未执行 → 容器内动态链接缓存缺失。
         # 这里改为把脚本拷进容器后用 chroot_exec 执行，效果与 Slackware 安装器一致。
+        # 解释器统一使用内置的静态 busybox（Slackware 安装器本身也是 busybox 环境），
+        # 原因有三：
+        #   1) aaa_base 是第一个解包的包，而 Slackware 的 /bin/sh -> bash 恰恰由它的
+        #      doinst.sh 创建，bash 自己也要靠 bash 包的 doinst.sh 把 bin/bash5.new
+        #      改名而来 —— 最早几个包执行时容器内没有任何 shell，旧写法直接调用
+        #      /bin/sh 必然失败且被 || true 吞掉，形成死锁（/bin/sh、/etc/shadow、
+        #      /etc/slackpkg/slackpkg.conf 全都生成不了，后者导致软件源更新失败）。
+        #   2) 本设备实测：容器内 glibc/bash 的 test -r 恒为假（同一文件 -e/-f/cat
+        #      均正常），而 busybox 的 test -r 正常；doinst.sh 里大量使用
+        #      `[ -r ... ]` 判断配置是否已存在，用 bash 会让 /etc/pam.d/*.new 这类
+        #      配置永不落地，进而 chpasswd/su 报 pam_start failure、无法设置密码。
+        #   3) busybox 的 sh 自带 applet 兜底，coreutils 尚未解包时也能提供 ln/grep 等。
         if [ -e "${CHROOT_DIR}/install/doinst.sh" ]; then
             cp -f "${CHROOT_DIR}/install/doinst.sh" "${CHROOT_DIR}/tmp/doinst.sh" 2>/dev/null || true
             if [ -f "${CHROOT_DIR}/tmp/doinst.sh" ]; then
+                cp -f "${TOOLS_DIR:-${ENV_DIR}/tools}/busybox" "${CHROOT_DIR}/tmp/busybox" 2>/dev/null || true
+                chmod 755 "${CHROOT_DIR}/tmp/busybox" 2>/dev/null || true
+                # aaa_glibc-solibs 的 doinst.sh 第一步是 `flock 9 || exit 11`
+                # （并发保护），而内置 busybox 未编译 flock applet：缺 flock 会让该
+                # 脚本直接跳过 /lib64/incoming → /lib64 的搬运，容器内就没有动态加载器
+                # ld-linux-aarch64.so.1，所有动态链接程序都会 exec 失败
+                # （报 “No such file or directory”）。容器内不存在并发安装场景，
+                # 这里放一个空实现的 flock 兜底。
+                printf '#!/tmp/busybox sh\nexit 0\n' > "${CHROOT_DIR}/tmp/flock" 2>/dev/null || true
+                chmod 755 "${CHROOT_DIR}/tmp/flock" 2>/dev/null || true
                 # doinst.sh 内部使用相对路径（etc/...、usr/...），必须在 / 下执行
-                chroot_exec /bin/sh -c "cd /; sh /tmp/doinst.sh" >/dev/null 2>&1 || true
+                chroot_exec /tmp/busybox sh -c "cd /; PATH=/tmp:\${PATH} /tmp/busybox sh /tmp/doinst.sh" >/dev/null 2>&1 || true
                 rm -f "${CHROOT_DIR}/tmp/doinst.sh"
             fi
         fi

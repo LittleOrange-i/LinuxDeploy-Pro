@@ -62,6 +62,8 @@ fun ConfigDetailScreen(
     onViewLogs: () -> Unit,
     onDelete: () -> Unit,
     onDeleteContainer: () -> Unit,
+    /** SSH 端口与哪个其它配置重复（null=不冲突）：用于提示"端口不可用" */
+    sshPortConflictWith: String? = null,
 ) {
     val context = LocalContext.current
     // 调整镜像大小弹窗状态
@@ -293,7 +295,16 @@ fun ConfigDetailScreen(
                 Column {
                     InfoLine("SSH", if (config.sshEnabled) "已启用" else "未启用")
                     HorizontalDivider()
-                    InfoLine("SSH 端口", config.sshPort)
+                    // 端口与其他配置重复时直接点明冲突对象：多容器共用同一端口会连到
+                    // 别的容器的 sshd 上（现象：密码总不对/环境不对），必须先改端口
+                    InfoLine(
+                        "SSH 端口",
+                        if (sshPortConflictWith != null) {
+                            "${config.sshPort}（与「${sshPortConflictWith}」重复，请修改）"
+                        } else {
+                            config.sshPort
+                        },
+                    )
                     HorizontalDivider()
                     // 不展示明文密码（安全）；编辑页可修改
                     InfoLine("默认密码", if (config.password.isBlank()) "未设置" else "已设置（编辑页可修改）")

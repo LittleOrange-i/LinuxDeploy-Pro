@@ -127,6 +127,7 @@ private fun defaultMirror(distro: String): String =
 @Composable
 fun ConfigScreen(
     initial: ContainerConfig?,
+    defaultSshPort: String = "22",
     onBack: () -> Unit,
     onSave: (ContainerConfig) -> Unit,
 ) {
@@ -145,7 +146,8 @@ fun ConfigScreen(
     val userGroupsState = rememberTextFieldState(
         initial?.userGroups ?: "aid_inet aid_sdcard_rw aid_graphics",
     )
-    val sshPortState = rememberTextFieldState(initial?.sshPort ?: "22")
+    // 新建时用调用方给出的"下一个空闲端口"（默认 22 之外的容器顺延，避免所有容器都抢 22）
+    val sshPortState = rememberTextFieldState(initial?.sshPort ?: defaultSshPort)
     val passwordState = rememberTextFieldState(initial?.password ?: "changeme")
 
     // 基础信息
@@ -527,6 +529,7 @@ fun ConfigScreen(
                         label = "SSH 端口",
                         state = sshPortState,
                         enabled = sshEnabled,
+                        hint = "每个容器必须使用不同端口：端口相同会连到别的容器的 SSH",
                     )
                 }
             }
@@ -698,6 +701,12 @@ fun ConfigScreen(
                     }
                     if (pathTrimmed.isEmpty()) {
                         Toast.makeText(context, "请填写容器路径", Toast.LENGTH_LONG).show()
+                        return@Button
+                    }
+                    // SSH 端口格式校验（1~65535）；"各容器端口不重复"由列表侧校验（见 MainScreen.saveConfig）
+                    val sshPortNum = sshPortState.text.toString().trim().ifBlank { "22" }.toIntOrNull()
+                    if (sshEnabled && (sshPortNum == null || sshPortNum !in 1..65535)) {
+                        Toast.makeText(context, "SSH 端口必须是 1~65535 的数字", Toast.LENGTH_LONG).show()
                         return@Button
                     }
                     onSave(

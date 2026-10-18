@@ -368,6 +368,33 @@ fun MainScreen(
         }
     }
 
+    /**
+     * 取与本配置 SSH 端口重复的其它配置名（null=无冲突）。
+     * 所有容器共享宿主网络命名空间：多个容器共用同一端口时，后启动的 sshd 无法
+     * 绑定，用户 ssh 还极可能连到"另一个容器"的 sshd 上（现象：密码总不对、环境不对）。
+     * 因此保存时拦截、详情页提示，强制每个容器的 SSH 端口互不相同。
+     * @param selfName 编辑场景下的"原配置名"（改名的配置不算与自己冲突）
+     */
+    fun sshPortConflict(cfg: ContainerConfig, selfName: String? = null): String? {
+        if (!cfg.sshEnabled) return null
+        return configs.firstOrNull {
+            it.name != cfg.name && it.name != selfName &&
+                it.sshEnabled && it.sshPort.trim() == cfg.sshPort.trim()
+        }?.name
+    }
+
+    /**
+     * 计算"下一个空闲 SSH 端口"：从 22 起顺延，跳过已被其它配置占用的端口。
+     * 新建配置若一律用默认 22，多容器场景下后启动的 sshd 无法绑定，
+     * 用户还可能连到别的容器上（端口冲突时强制各容器端口互不相同，见 saveConfig）。
+     */
+    fun nextFreeSshPort(): String {
+        val used = configs.mapNotNull { it.sshPort.trim().toIntOrNull() }.toSet()
+        var port = 22
+        while (port in used && port < 65535) port++
+        return port.toString()
+    }
+
     /** 保存（新建或编辑）配置：先写本地列表校验，再写 CLI，都成功才算保存 */
     fun saveConfig(cfg: ContainerConfig, originalName: String?) {
         val selfIndex = originalName?.let { n -> configs.indexOfFirst { it.name == n } } ?: -1
@@ -375,6 +402,18 @@ fun MainScreen(
         if (conflictIndex >= 0 && conflictIndex != selfIndex) {
             appendLog("保存失败：已存在同名配置 ${cfg.name}")
             Toast.makeText(context, "配置名称已存在：${cfg.name}", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // SSH 端口唯一性：多个容器共用同一端口时，后启动的 sshd 无法绑定，且用户
+        // ssh 很可能连到"另一个容器"的 sshd 上（表现为密码总不对、环境不对）。
+        // 这里在保存时直接拦截，强制每个容器的 SSH 端口互不相同。
+        sshPortConflict(cfg, originalName)?.let { dup ->
+            appendLog("保存失败：SSH 端口 ${cfg.sshPort} 已被配置「${dup}」占用")
+            Toast.makeText(
+                context,
+                "SSH 端口 ${cfg.sshPort} 已被「${dup}」占用，请改用其它端口",
+                Toast.LENGTH_LONG,
+            ).show()
             return
         }
         if (busy) {
@@ -791,6 +830,8 @@ fun MainScreen(
         route() == "new" -> {
             ConfigScreen(
                 initial = null,
+                // 新建时直接给一个未被占用端口，避免每个容器都默认抢 22
+                defaultSshPort = nextFreeSshPort(),
                 onBack = { popRoute() },
                 onSave = { cfg -> saveConfig(cfg, null) },
             )
@@ -853,6 +894,8 @@ fun MainScreen(
             } else {
                 ConfigDetailScreen(
                     config = cfg,
+                    // 端口与其他启用 SSH 的配置重复时，详情页直接提示冲突对象
+                    sshPortConflictWith = sshPortConflict(cfg),
                     onBack = { popRoute() },
                     onEdit = { openEdit(detailName) },
                     onToggleRunning = { toggleRunning(cfg) },

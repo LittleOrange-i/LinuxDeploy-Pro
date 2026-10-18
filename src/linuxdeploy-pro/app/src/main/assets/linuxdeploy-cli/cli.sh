@@ -443,13 +443,18 @@ ldstatus_pid()
 
 # 判断容器内 sshd 是否在运行：遍历 /proc/<pid>/root 指向容器的进程，判断 argv[0]。
 # 不依赖容器当前命名空间可见（容器常运行在独立 mount ns 里，本进程看不到其挂载）。
-# 必须按 argv[0]（或 -D 绝对路径）精确判断：
-#   - 早期实现用 “cmdline 含 sshd”，会把 sshd-session、sshd-auth 这类会话子进程
-#     也算作“正在监听”，容器重启后残留的会话进程会让 UI 误报 SSH 运行中；
-#   - 只认 sshd / */sshd / *sshd -D 这类主进程形态，保证状态与真实端口一致。
+# 判定必须区分"监听主进程"与"会话/特权分离子进程"：
+#   现代 OpenSSH 用 setproctitle 改写 argv，/proc/<pid>/cmdline 首段变成标题串：
+#     监听主进程        sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups
+#     会话子进程        sshd: root@pts/0 / sshd: root@notty
+#     特权分离子进程    sshd: root [priv] / sshd: root [net]
+#     OpenSSH 9.8+ 的   /usr/sbin/sshd-session、sshd-auth
+#   旧实现只比较 argv[0] 是否等于 sshd / 以 /sshd 结尾，被改写后永远匹配不到，
+#   表现为"容器能连上 SSH，界面却显示 SSH 未运行（容器内 sshd 未启动）"；
+#   同时也要避免把残留的会话子进程当成"服务在跑"（早期用 cmdline 含 sshd 的写法）。
 sshd_running()
 {
-    local pid_dir pid target real a0 a1 root
+    local pid_dir pid target real a0 root
     target="${CHROOT_DIR%/}"
     [ -n "${target}" ] || return 1
     real=$(container_dir_real)
@@ -466,14 +471,23 @@ sshd_running()
         # 得到的该标记作为运行判据（见下文），避免为进程存在性再全量扫一遍 /proc。
         _LD_CONTAINER_STARTED=1
         a0=$(tr '\0' '\n' < "${pid_dir}/cmdline" 2>/dev/null | head -1)
+        [ -n "${a0}" ] || continue
+        # 未改写 argv 的常见形态：sshd / /usr/sbin/sshd
         case "${a0}" in
         sshd|*/sshd) return 0 ;;
         esac
-        # 部分发行版以 “sshd -D ...”（a0=sshd 已覆盖）或被重命名的方式启动，
-        # 再按参数兜底一次（避免把 -session/-auth 子进程算进来）
-        a1=$(tr '\0' '\n' < "${pid_dir}/cmdline" 2>/dev/null | head -2 | tail -1)
-        case "${a1}" in
-        -D|-[Dd]*|--daemon) case "${a0}" in *sshd*|-sshd|*/sshd*) return 0 ;; esac ;;
+        # 会话/特权分离子进程（OpenSSH 9.8+ 的 sshd-session、sshd-auth 亦属此类）：排除
+        case "${a0}" in
+        *sshd-session*|*sshd-auth*) continue ;;
+        esac
+        # 改写后的标题串：含 sshd 且不带会话/分离子进程标志，视为监听主进程
+        case "${a0}" in
+        *sshd*)
+            case "${a0}" in
+            *"[priv]"*|*"[net]"*|*"[session]"*|*@*) ;;
+            *) return 0 ;;
+            esac
+        ;;
         esac
     done
     return 1
