@@ -11,6 +11,9 @@
 #    老客户端连接直接报 “no matching host key type”。
 # 3) Alpine/Arch 默认没有 /run/sshd 与 host key，需显式生成。
 # 4) 监听失败时只报“已启动”，用户无法判断端口是否真的可用；这里启动后回读监听结果。
+# 5) 安卓容器内无 systemd/audit：/etc/pam.d/sshd 的 pam_loginuid 写 loginuid
+#    失败，表现为“密码验证成功后连接立即被关闭/重置”（pam_open_session 中止）。
+#    这里把 pam_loginuid 降级为 optional（Docker 官方镜像同款处理）。
 
 [ -n "${SSH_PORT}" ] || SSH_PORT="22"
 
@@ -95,6 +98,29 @@ ssh_config_apply()
     # 容器内没有 systemd 的运行目录时，sshd 的 privsep 目录缺失会直接启动失败
     make_dirs "${CHROOT_DIR}/run/sshd" "${CHROOT_DIR}/var/run/sshd" "${CHROOT_DIR}/var/empty"
     chmod 755 "${CHROOT_DIR}/run/sshd" "${CHROOT_DIR}/var/run/sshd" 2>/dev/null || true
+    # PAM 会话加固：容器内没有 systemd/audit 子系统，Debian 系 /etc/pam.d/sshd 里的
+    # `session required pam_loginuid.so` 在安卓内核上写 /proc/self/loginuid 会以
+    # EPERM 失败，导致“密码验证成功后连接立即被服务端关闭/重置”
+    # （sshd 在 pam_open_session 阶段中止会话，客户端表现为 Connection reset /
+    #  Connection closed by remote host）。把该模块降级为 optional 是容器环境的
+    # 标准做法（Docker 官方 openssh 镜像同样处理）；认证本身不受影响
+    # （pam_authenticate 走 common-auth，与 loginuid 无关）。
+    local pam_f
+    for pam_f in "${CHROOT_DIR}/etc/pam.d/sshd" "${CHROOT_DIR}"/etc/pam.d/common-session*
+    do
+        [ -f "${pam_f}" ] || continue
+        if grep -Eq '^[[:space:]]*session[[:space:]]+required[[:space:]]+pam_loginuid\.so' "${pam_f}" 2>/dev/null; then
+            sed -i -E 's|^([[:space:]]*session[[:space:]]+)required([[:space:]]+pam_loginuid\.so)|\1optional\2|' "${pam_f}"
+            msg ":: 已将 ${pam_f#"${CHROOT_DIR}"} 的 pam_loginuid 降级为 optional（容器内无 audit 子系统）"
+        fi
+    done
+    # OpenSSH 9.8+ 把会话处理拆分到独立二进制 sshd-session：安装不完整时表现为
+    # “TCP 能连上、甚至能输密码，但会话建立立即失败”。这里明确告警便于定位。
+    if sshd_ready && [ -d "${CHROOT_DIR}/usr/lib/openssh" ] \
+       && [ ! -e "${CHROOT_DIR}/usr/lib/openssh/sshd-session" ]; then
+        msg "[警告] 容器内缺少 /usr/lib/openssh/sshd-session（OpenSSH 9.8+ 的会话组件），"
+        msg "        SSH 会话可能建立失败，请在容器内重装 openssh-server"
+    fi
     # root 的 authorized_keys：有的发行版模板带 AuthorizedKeysFile 相对路径，
     # 统一确保 ~/.ssh 存在且权限正确（否则公钥登录/部分客户端的密钥协商会告警）
     local root_ssh="${CHROOT_DIR}/root/.ssh"
