@@ -176,8 +176,14 @@ object ConfigStore {
         val sshEnabled = components.split(Regex("[ ,]+")).contains("extra/ssh")
         val targetType = kv["TARGET_TYPE"] ?: "directory"
         val mounts = kv["MOUNTS"].orEmpty().split(" ").filter { it.isNotBlank() }
-        // 初始化系统：旧配置无 INIT 键时默认 sysv（与 CLI INIT="${INIT:-sysv}" 兜底一致）
-        val initRaw = kv["INIT"] ?: "sysv"
+        // 初始化系统：旧配置无 INIT 键时按发行版兜底（与 CLI 主流程一致）：
+        // Debian 系用 sysv（/etc/rcN.d），其余用 run-parts（/etc/rc.d）。
+        // 早期统一按 sysv 兜底，导致 Alpine/Arch/Slackware 启动时找不到 rc3.d，
+        // 服务（含 sshd）从未被拉起。
+        val initRaw = kv["INIT"] ?: when (kv["DISTRIB"] ?: "debian") {
+            "debian", "ubuntu", "kali" -> "sysv"
+            else -> "run-parts"
+        }
         return ContainerConfig(
             name = name,
             distro = kv["DISTRIB"] ?: "debian",

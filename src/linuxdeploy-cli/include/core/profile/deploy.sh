@@ -5,6 +5,38 @@
 [ -n "${USER_NAME}" ] || USER_NAME="root"
 [ -n "${USER_PASSWORD}" ] || USER_PASSWORD="changeme"
 
+# 判断容器内是否具备 chpasswd
+profile_has_chpasswd()
+{
+    chroot_exec -u root /bin/sh -c 'command -v chpasswd >/dev/null 2>&1' >/dev/null 2>&1
+}
+
+# 无 chpasswd 时的兜底：用容器内 openssl passwd 生成哈希并写入 /etc/shadow。
+# 适用 Alpine（shadow 包缺失）等精简系统；root 使用 -6（SHA-512），
+# 其他发行版若 openssl 不支持 -6 则退回 -1（MD5，仍可被 sshd 校验）。
+profile_set_password_shadow()
+{
+    local user="${USER_NAME}" pass="${USER_PASSWORD}" shadow hash
+    shadow="${CHROOT_DIR}/etc/shadow"
+    [ -r "${shadow}" ] || return 1
+    hash=$(chroot_exec -u root /bin/sh -c "openssl passwd -6 '${pass}' 2>/dev/null") || true
+    case "${hash}" in
+    '$6$'*) ;;
+    *) hash=$(chroot_exec -u root /bin/sh -c "openssl passwd -1 '${pass}' 2>/dev/null") || true ;;
+    esac
+    case "${hash}" in
+    '$'*) ;;
+    *)
+        # openssl 也不可用：明确失败（由调用方提示），不写入半成品 shadow
+        return 1
+    ;;
+    esac
+    # 替换目标用户的第 2 字段（密码哈希），保留其余字段
+    awk -F: -v OFS=: -v u="${user}" -v h="${hash}" '$1==u{$2=h} {print}' "${shadow}" > "${shadow}.ldtmp" \
+        && mv -f "${shadow}.ldtmp" "${shadow}" && chmod 600 "${shadow}"
+    return 0
+}
+
 # 设置账号密码。
 # 注意：chpasswd 失败时若只打印日志，账号会停留在 /etc/shadow 的 "*"（锁定态），
 # 表现为 SSH 输入正确密码仍 Permission denied。这里必须把失败向上抛出，
@@ -18,9 +50,18 @@ profile_set_password()
         return 1
     fi
     # chpasswd 读取 "用户:密码"（stdin 经 chroot_exec 透传）
-    if ! printf '%s:%s\n' "${user}" "${pass}" | chroot_exec -u root chpasswd; then
-        msg "[错误] chpasswd 执行失败，无法为 ${user} 设置密码"
-        return 1
+    if profile_has_chpasswd; then
+        if ! printf '%s:%s\n' "${user}" "${pass}" | chroot_exec -u root chpasswd; then
+            msg "[错误] chpasswd 执行失败，无法为 ${user} 设置密码"
+            return 1
+        fi
+    else
+        # Alpine 精简镜像/部分 Arch 容器没有 chpasswd，走 openssl 哈希兜底
+        msg "   [提示] 容器内无 chpasswd，改用 openssl 直接写入 /etc/shadow"
+        if ! profile_set_password_shadow; then
+            msg "   [错误] 容器内缺少 chpasswd/openssl，${user} 密码无法设置（可在终端执行 passwd 修改）"
+            return 1
+        fi
     fi
     # 校验：shadow 第二字段为 "*" / "!" / "!!" 表示锁定，视为设置失败
     if [ -r "${shadow}" ]; then

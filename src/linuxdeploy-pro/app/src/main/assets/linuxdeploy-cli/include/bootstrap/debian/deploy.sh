@@ -40,20 +40,8 @@ BASE_EXCLUDE_PACKAGES="init,systemd-sysv"
 # 一阶段完成后额外安装的包（依赖非 main 分区，需先配好完整 apt 源）
 BASE_UNIVERSE_PACKAGES="fish"
 
-# apt 安装辅助函数：更新索引并静默安装指定包
-apt_install()
-{
-    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
-    local packages
-    packages="$@"
-    [ -n "${packages}" ] || return 1
-    (set -e
-        log_exec chroot_exec -u root apt-get update -yq
-        log_exec chroot_exec -u root "DEBIAN_FRONTEND=noninteractive apt-get install -yfq --no-install-recommends ${packages}"
-        log_exec chroot_exec -u root apt-get clean
-    exit 0)
-    return $?
-}
+# apt 安装函数 apt_install 已下沉到 cli.sh 公共层（bootstrap 与后续组件共用），
+# 此处不再重复定义，避免两处实现不一致。
 
 # 确保容器内核心虚拟文件系统可用
 # debootstrap 二阶段结束退出时，会自动卸载 /proc、/sys、/dev、/dev/shm、/dev/pts，
@@ -73,6 +61,14 @@ ensure_container_fs()
 }
 
 # 配置 apt 软件源
+# 说明：本函数被 bootstrap/kali（EXTENDS=bootstrap/debian）复用。
+# 早期实现把主机与分区写死为 Debian 的 ${SOURCE_PATH}（默认中科大 /debian/），
+# Kali 部署后 sources.list 指向 Debian 仓库：apt update 报 Release 不匹配/
+# 签名错误，后续装包（openssh-server 等）全部失败，表现为“能启动但 SSH 连不上”。
+# 这里按发行版分别生成：
+# - Debian：主源 + contrib/non-free/non-free-firmware；
+# - Kali：kali-rolling 的 main/contrib/non-free/non-free-firmware；
+# - Ubuntu：main/universe/multiverse/restricted（由 bootstrap/ubuntu 覆盖，这里兜底）。
 apt_repository()
 {
     # 备份原始 sources.list（若存在）
@@ -87,9 +83,25 @@ apt_repository()
     if [ ! -s "${CHROOT_DIR}/etc/resolv.conf" ]; then
         cp /etc/resolv.conf "${CHROOT_DIR}/etc/resolv.conf" 2>/dev/null || true
     fi
-    # 写入 trixie 软件源；Debian 12+ 固件组件为 non-free-firmware
-    echo "deb ${SOURCE_PATH} ${SUITE} main contrib non-free non-free-firmware" > "${CHROOT_DIR}/etc/apt/sources.list"
-    echo "deb-src ${SOURCE_PATH} ${SUITE} main contrib non-free non-free-firmware" >> "${CHROOT_DIR}/etc/apt/sources.list"
+    # Kali 的签名由 kali-archive-keyring 提供：官方/镜像源均为 http 时无需额外配置，
+    # 但 debootstrap 内置的 kali 脚本会指向 http.kali.org，这里按用户配置的源写入。
+    local src="${SOURCE_PATH%/}"
+    case "${DISTRIB}" in
+    kali)
+        # Kali 滚动源：kali-rolling 只有 main/contrib/non-free/non-free-firmware
+        echo "deb ${src}/ kali-rolling main contrib non-free non-free-firmware" > "${CHROOT_DIR}/etc/apt/sources.list"
+        echo "deb-src ${src}/ kali-rolling main contrib non-free non-free-firmware" >> "${CHROOT_DIR}/etc/apt/sources.list"
+    ;;
+    ubuntu)
+        echo "deb ${src}/ ${SUITE} main universe multiverse restricted" > "${CHROOT_DIR}/etc/apt/sources.list"
+        echo "deb-src ${src}/ ${SUITE} main universe multiverse restricted" >> "${CHROOT_DIR}/etc/apt/sources.list"
+    ;;
+    *)
+        # 写入 trixie 软件源；Debian 12+ 固件组件为 non-free-firmware
+        echo "deb ${src}/ ${SUITE} main contrib non-free non-free-firmware" > "${CHROOT_DIR}/etc/apt/sources.list"
+        echo "deb-src ${src}/ ${SUITE} main contrib non-free non-free-firmware" >> "${CHROOT_DIR}/etc/apt/sources.list"
+    ;;
+    esac
 }
 
 # 安装主流程：debootstrap 一阶段（解包）+ 二阶段（chroot 内配置）

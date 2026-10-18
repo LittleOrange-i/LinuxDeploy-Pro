@@ -23,18 +23,7 @@ then
     esac
 fi
 
-yum_install()
-{
-    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
-    local packages
-    packages="$@"
-    [ -n "${packages}" ] || return 1
-    (set -e
-        chroot_exec -u root yum install ${packages} --nogpgcheck --skip-broken -y
-        chroot_exec -u root yum clean all
-    exit 0)
-    return $?
-}
+# yum 安装函数已下沉到 cli.sh 公共层（bootstrap 与后续组件共用），此处不再重复定义。
 
 yum_groupinstall()
 {

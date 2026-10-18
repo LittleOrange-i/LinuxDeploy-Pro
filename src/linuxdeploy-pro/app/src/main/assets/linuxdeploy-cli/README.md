@@ -1,4 +1,4 @@
-# Linux Deploy CLI 4.1.15
+# Linux Deploy CLI 4.1.20
 
 > 维护：GanYu256 | 全中文日志 | 无配置锁（统一 -c 指定配置） | 只维护 arm64
 
@@ -13,7 +13,13 @@ Linux Deploy CLI 是 LinuxDeploy-Pro 的命令行工具，提供 chroot 容器�
 - 基线：app 锁定版 `79924f593556`（VERSION 2.5.1）
 - 4.0：全面重构——命令层重设计、安全护栏、中文日志
 - 4.1.x：无配置锁（统一 -c 指定配置）、运行状态检测改为容器内 ldstatus 标记进程
-  与配置侧锚点（跨命名空间可靠）、systemctl 初始化模式、版本号统一（当前 4.1.15）
+  与配置侧锚点（跨命名空间可靠）、systemctl 初始化模式、版本号统一（当前 4.1.20）
+- 4.1.20：非 Debian 发行版（Alpine/Arch/Slackware/Kali）部署与 SSH 修复——
+  初始化系统按发行版默认 run-parts、ssh 配置与片段统一、DNS 回退（Android 8+）、
+  Alpine 软件源归一化、Kali 源修正、Arch ARM 镜像路径适配、容器启动信息跨命名空间落盘；
+  包管理器安装函数（apt/apk/pacman/yum/dnf/slackpkg）下沉到 cli.sh 公共层
+  （修复部署后段组件调用时报 inaccessible or not found）；挂载判定兼容 `/proc/mounts`
+  路径尾斜杠（修复 /dev/pts 误判导致的 apt 报错）
 - 设计文档：[docs/设计说明.md](docs/设计说明.md)
 
 ## 环境要求

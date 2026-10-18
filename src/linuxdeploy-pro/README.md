@@ -1,4 +1,4 @@
-# LinuxDeploy-Pro 4.1.13（Android 前端）
+# LinuxDeploy-Pro 4.1.20（Android 前端）
 
 LinuxDeploy Android 前端：Kotlin + Jetpack Compose + Miuix（HyperOS 风格）。
 CLI（`../linuxdeploy-cli`）为唯一数据源，前端通过 `su -c` 调用 `cli.sh` 执行

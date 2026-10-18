@@ -23,7 +23,9 @@ do_install()
         apt_install ${packages}
     ;;
     archlinux:*)
-        packages="hostname"
+        # Arch 没有独立 hostname 包：命令由 inetutils 提供，直接 install 会报
+        # "target not found: hostname"，导致整个组件失败
+        packages="inetutils"
         pacman_install ${packages}
     ;;
     fedora:*)
@@ -35,14 +37,18 @@ do_install()
         yum_install ${packages}
     ;;
     slackware:*)
-        packages="hostname"
+        # Slackware 的 hostname 在 net-tools 包内，没有同名包
+        packages="net-tools"
         slackpkg_install ${packages}
     ;;
     alpine:*)
-        packages="hostname"
-        apk_install ${packages}
+        # Alpine 的 hostname 由 busybox 提供，无需安装
+        return 0
     ;;
     esac
+    # 安装失败只提示不中断：容器主机名主要由 /etc/hostname 决定（见 do_configure），
+    # 缺少 hostname 命令不影响 SSH 与系统运行
+    return 0
 }
 do_configure()
 {

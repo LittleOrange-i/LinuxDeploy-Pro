@@ -277,8 +277,9 @@ fun ConfigDetailScreen(
                     InfoLine(
                         "初始化系统",
                         when (config.init) {
-                            "run-parts" -> "run-parts（${config.initPath.ifBlank { "未设置路径" }}）"
+                            "run-parts" -> "run-parts（${config.initPath.ifBlank { "/etc/rc.d" }}）"
                             "systemctl" -> "systemctl（init 模式）"
+                            "openrc" -> "OpenRC（/etc/runlevels）"
                             else -> "SysV（rc${config.initLevel}）"
                         },
                     )

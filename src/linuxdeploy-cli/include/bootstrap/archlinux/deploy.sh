@@ -30,27 +30,34 @@ then
     esac
 fi
 
-pacman_install()
+# 判断软件源是否为 Arch Linux ARM 镜像（…/archlinuxarm 或 …/archlinuxarm/）。
+# ARM 镜像与 x86_64 官方仓库目录结构不同：
+# - 官方 x86_64：<源>/core/os/x86_64/，mirrorlist 用 $repo/os/$arch；
+# - ALARM：     <源>/aarch64/core/，mirrorlist 用 $arch/$repo；
+# 用户/前端若把 ARM 镜像填到 x86_64 架构（或反过来），旧实现会拼出错路径，
+# pacman 报 “failed to retrieve core.db”，部署在软件包列表阶段失败。
+arch_is_alarm()
 {
-    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
-    local packages
-    packages="$@"
-    [ -n "${packages}" ] || return 1
-    (set -e
-        #rm -f ${CHROOT_DIR}/var/lib/pacman/db.lck || true
-        chroot_exec -u root pacman -Syq --overwrite="*" --noconfirm ${packages}
-        rm -f "${CHROOT_DIR}"/var/cache/pacman/pkg/* || true
-    exit 0)
-    return $?
+    case "${SOURCE_PATH%/}" in
+    *archlinuxarm*) return 0 ;;
+    esac
+    return 1
 }
+
+# pacman 安装函数已下沉到 cli.sh 公共层（bootstrap 与后续组件共用），此处不再重复定义。
 
 pacman_repository()
 {
-    case "$(get_platform ${ARCH})" in
-    x86_64) local repo_url="${SOURCE_PATH%/}/\$repo/os/\$arch" ;;
-    arm*|x86) local repo_url="${SOURCE_PATH%/}/\$arch/\$repo" ;;
-    *) return 1 ;;
-    esac
+    # 按软件源实际类型决定仓库路径模板（先判 ALARM，再判官方 x86_64）
+    if arch_is_alarm; then
+        local repo_url="${SOURCE_PATH%/}/\$arch/\$repo"
+    else
+        case "$(get_platform ${ARCH})" in
+        x86_64) local repo_url="${SOURCE_PATH%/}/\$repo/os/\$arch" ;;
+        arm*|x86) local repo_url="${SOURCE_PATH%/}/\$arch/\$repo" ;;
+        *) return 1 ;;
+        esac
+    fi
     sed -i "s|^[[:space:]]*Architecture[[:space:]]*=.*$|Architecture = ${ARCH}|" "${CHROOT_DIR}/etc/pacman.conf"
     sed -i "s|^[[:space:]]*\(CheckSpace\)|#\1|" "${CHROOT_DIR}/etc/pacman.conf"
     sed -i "s|^[[:space:]]*SigLevel[[:space:]]*=.*$|SigLevel = Never|" "${CHROOT_DIR}/etc/pacman.conf"
@@ -77,11 +84,16 @@ do_install()
 
 	local def_extra_packages=libbsd
     local repo_url
-    case "$(get_platform ${ARCH})" in
-    x86_64) repo_url="${SOURCE_PATH%/}/core/os/${ARCH}" ;;
-    arm*|x86) repo_url="${SOURCE_PATH%/}/${ARCH}/core" ;;
-    *) return 1 ;;
-    esac
+    # 与 pacman_repository 保持同一套路径规则（ARM 镜像优先）
+    if arch_is_alarm; then
+        repo_url="${SOURCE_PATH%/}/${ARCH}/core"
+    else
+        case "$(get_platform ${ARCH})" in
+        x86_64) repo_url="${SOURCE_PATH%/}/core/os/${ARCH}" ;;
+        arm*|x86) repo_url="${SOURCE_PATH%/}/${ARCH}/core" ;;
+        *) return 1 ;;
+        esac
+    fi
 
     msg -n "正在准备部署 ... "
     local cache_dir="${CHROOT_DIR}/var/cache/pacman/pkg"

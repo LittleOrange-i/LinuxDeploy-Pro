@@ -1,6 +1,7 @@
 #!/bin/sh
 # Linux Deploy Component
 # (c) Anton Skshidlevsky <meefik@gmail.com>, GPLv3
+# 维护：GanYu256（各发行版兼容修复）
 
 [ -n "${SUITE}" ] || SUITE="latest-stable"
 
@@ -20,29 +21,60 @@ esac
 
 [ -n "${SOURCE_PATH}" ] || SOURCE_PATH="http://dl-cdn.alpinelinux.org/alpine/"
 
+# 归一化软件源目录：Alpine 仓库根是 “<源>/<版本分支>/”，即 …/alpine/v3.22。
+# 前端默认镜像（镜像站根 /alpine/）与用户手填的 …/alpine/v3.22 都可能出现，
+# 早期实现会把版本号再拼一次，得到 …/alpine/v3.22/v3.22/main 导致 404，
+# 表现为部署在“正在获取 rootfs 归档”阶段失败。
+apk_branch()
+{
+    local src="${SOURCE_PATH%/}" suite="${SUITE}"
+    # 源里已带版本目录（v3.x / edge）时以源为准，不再重复拼接
+    case "${src}" in
+    */v[0-9]*.*|*/edge) echo "${src}"; return 0 ;;
+    esac
+    case "${suite}" in
+    ""|latest-stable|stable|latest) echo "${src}/latest-stable" ;;
+    v[0-9]*|edge) echo "${src}/${suite}" ;;
+    *) echo "${src}/v${suite}" ;;
+    esac
+}
+
+# rootfs 归档名：优先读 latest-releases.yaml；
+# 镜像站未同步该文件或格式变化时，回退为目录列表匹配（不依赖文件内的字段顺序）。
+apk_rootfs_name()
+{
+    local branch="$1" name=""
+    name=$(wget -q -O - "${branch}/releases/${ARCH}/latest-releases.yaml" 2>/dev/null \
+        | grep -m1 "file: alpine-minirootfs" | awk '{print $2}' | tr -d '"' | tr -d "'")
+    if [ -z "${name}" ]; then
+        # 回退：抓目录索引，取最新的 alpine-minirootfs-<版本>-<arch>.tar.gz
+        name=$(wget -q -O - "${branch}/releases/${ARCH}/" 2>/dev/null \
+            | grep -o "alpine-minirootfs-[0-9.]*-${ARCH}\.tar\.gz" | sort -V | tail -1)
+    fi
+    [ -n "${name}" ] || return 1
+    echo "${name}"
+}
+
 apk_repository()
 {
+  local branch
+  branch=$(apk_branch)
   # Backup repositories
   if [ -e "${CHROOT_DIR}/etc/apk/repositories" ]; then
       cp "${CHROOT_DIR}/etc/apk/repositories" "${CHROOT_DIR}/etc/apk/repositories.bak"
   fi
-  # Update repositories
-  echo "${SOURCE_PATH%/}/${SUITE}/main" > "${CHROOT_DIR}/etc/apk/repositories"
-  echo "${SOURCE_PATH%/}/${SUITE}/community" >> "${CHROOT_DIR}/etc/apk/repositories"
+  # Update repositories（branch 已含版本目录，避免重复拼接）
+  mkdir -p "${CHROOT_DIR}/etc/apk"
+  echo "${branch}/main" > "${CHROOT_DIR}/etc/apk/repositories"
+  echo "${branch}/community" >> "${CHROOT_DIR}/etc/apk/repositories"
+  # Alpine 默认不信任 https 源，若用户配置了 https 镜像需装证书后才会生效；
+  # 部署阶段先用 http 完成基础安装，软件源原样写入（由 ca-certificates 保障）。
+  if [ ! -s "${CHROOT_DIR}/etc/resolv.conf" ] && [ -s /etc/resolv.conf ]; then
+      cp /etc/resolv.conf "${CHROOT_DIR}/etc/resolv.conf" 2>/dev/null || true
+  fi
 }
 
-apk_install()
-{
-    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
-    local packages
-    packages="$@"
-    [ -n "${packages}" ] || return 1
-    (set -e
-        chroot_exec -u root apk update || true
-        chroot_exec -u root apk add ${packages}
-    exit 0)
-    return $?
-}
+# apk 安装函数已下沉到 cli.sh 公共层（bootstrap 与后续组件共用），此处不再重复定义。
 
 do_install()
 {
@@ -50,11 +82,26 @@ do_install()
 
     msg ":: 正在安装 ${COMPONENT} ... "
 
+    local branch rootfs_name
+    branch=$(apk_branch)
     msg -n "正在获取 rootfs 归档 ... "
-    local repo_url="${SOURCE_PATH%/}/${SUITE}"
-    local rootfs_name=$(wget -q -O - "${repo_url}/releases/${ARCH}/latest-releases.yaml" | grep -m1 "file: alpine-minirootfs" | awk '{print $2}')
-    wget -q -O - "${repo_url}/releases/${ARCH}/${rootfs_name}" | tar xz -C "${CHROOT_DIR}"
-    is_ok "失败" "完成" || return 1
+    rootfs_name=$(apk_rootfs_name "${branch}")
+    if [ -z "${rootfs_name}" ]; then
+        msg "失败"
+        msg "[提示] 无法从 ${branch}/releases/${ARCH}/ 获取 Alpine rootfs 文件名。"
+        msg "        请检查软件源地址（应指向 Alpine 仓库根，如 http://mirrors.tuna.tsinghua.edu.cn/alpine/）与网络。"
+        return 1
+    fi
+    msg "完成（${rootfs_name}）"
+    mkdir -p "${CHROOT_DIR}"
+    if ! wget -q -O - "${branch}/releases/${ARCH}/${rootfs_name}" | tar xz -C "${CHROOT_DIR}" 2>/dev/null; then
+        msg "[错误] Alpine rootfs 下载或解包失败（${branch}/releases/${ARCH}/${rootfs_name}）"
+        return 1
+    fi
+    if [ ! -e "${CHROOT_DIR}/etc/alpine-release" ] && [ ! -x "${CHROOT_DIR}/bin/busybox" ]; then
+        msg "[错误] 解包后未检测到 Alpine 基础系统文件，rootfs 可能不完整"
+        return 1
+    fi
 
     component_exec core/emulator core/mnt core/net
 
@@ -69,7 +116,11 @@ do_install()
     # - bash：脚本与交互默认 shell（ldstatus、终端优先使用）
     # - curl、wget、ca-certificates：包下载与 https 校验（各组件/用户常用）
     # - openssh-client：容器内可主动 ssh 出去（部分组件与用户习惯依赖）
-    apk_install shadow sudo tzdata bash curl wget ca-certificates openssh-client ${EXTRA_PACKAGES}
+    # - openrc：服务管理（init/openrc 组件依赖 rc-service/rc-update）
+    # - util-linux：setsid 等基础工具（ldstatus 依赖 busybox 时也能兜底）
+    local extra_pkgs
+    extra_pkgs=$(normalize_packages "${EXTRA_PACKAGES}")
+    apk_install shadow sudo tzdata bash curl wget ca-certificates openssh-client openrc util-linux ${extra_pkgs}
     is_ok || return 1
 
     return 0
@@ -82,7 +133,7 @@ cat <<EOF
      Architecture of Linux distribution, supported "aarch64", "armhf", "x86" and "x86_64".
 
    --suite="${SUITE}"
-     Version of Linux distribution, supported version "latest-stable", "edge".
+     Version of Linux distribution, supported version "latest-stable", "3.22", "edge".
 
    --source-path="${SOURCE_PATH}"
      Installation source, can specify address of the repository or path to the rootfs archive.

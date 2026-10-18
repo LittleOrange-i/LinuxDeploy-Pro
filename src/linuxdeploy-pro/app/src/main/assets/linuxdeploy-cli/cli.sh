@@ -1,14 +1,14 @@
 #!/bin/bash
 ################################################################################
 #
-# Linux Deploy CLI 4.1.19
+# Linux Deploy CLI 4.1.20
 # 维护：GanYu256
 # 说明：本版本为全面重构，命令层重设计、无配置锁（统一 -c 指定配置）、全中文注释与日志。
 # 基线：app 锁定版 79924f593556（原 VERSION 2.5.1）
 #
 ################################################################################
 
-VERSION="4.1.19"
+VERSION="4.1.20"
 
 ################################################################################
 # 公共工具
@@ -174,7 +174,11 @@ log_open()
 {
     local name="${1:-default}"
     LOG_DIR="${LOG_DIR:-${BUILD_DIR}/logs}"
-    mkdir -p "${LOG_DIR}" 2>/dev/null || { msg "[错误] 无法创建日志目录：${LOG_DIR}"; return 1; }
+    mkdir -p "${LOG_DIR}" 2>/dev/null || {
+        # 日志目录不可写时退到容器同级目录（避免整条命令因日志失败而中止）
+        LOG_DIR="$(dirname "${CHROOT_DIR%/}")/linuxdeploy-logs"
+        mkdir -p "${LOG_DIR}" 2>/dev/null || { msg "[错误] 无法创建日志目录：${LOG_DIR}"; return 1; }
+    }
     # 时间戳命名（配置名-日期-时分秒）：每次操作独立日志文件，前端按最新文件尾随展示。
     LOG_FILE="${LOG_DIR}/${name}-$(date '+%Y%m%d-%H%M%S').log"
     : > "${LOG_FILE}" || { msg "[错误] 无法创建日志文件：${LOG_FILE}"; return 1; }
@@ -303,6 +307,11 @@ user_shell()
 # realpath 解析结果按进程内缓存：同一路径重复查询（如容器启动时的多点位
 # 轮询）只 fork 一次 readlink，避免频繁调用时的重复解析开销。
 # 注意：只缓存"路径→realpath"映射（稳定），挂载状态始终实时读 /proc/mounts。
+# 匹配同时兼容两种写法：目标路径后带 "/"（子挂载，如 /dev/pts/）与不带。
+# 早期只匹配 " <路径> "，而 /proc/mounts 中根挂载常写成 "/data/local/tmp/x /"，
+# 子挂载写成 "/data/local/tmp/x/dev/pts /dev/pts ..."（路径后紧跟 "/"），
+# 导致已挂载的 /dev/pts 被判为“未挂载”，apt 安装时反复报
+# “E: Can not write log (Is /dev/pts mounted?) - posix_openpt (19: No such device)”。
 is_mounted()
 {
     local target="$1" real
@@ -315,7 +324,7 @@ is_mounted()
         _LD_MNT_REAL="${real}"
     fi
     [ -n "${real}" ] || real="${target}"
-    grep -q " ${real} " /proc/mounts
+    grep -q -e " ${real} " -e " ${real%/}/" /proc/mounts 2>/dev/null
 }
 
 # 判断路径是否位于共享存储（/storage/emulated/0、/sdcard 这类 FUSE/sdcardfs 视图）。
@@ -418,11 +427,15 @@ ldstatus_pid()
     cat "${CHROOT_DIR}/run/ldstatus/pid" 2>/dev/null | tr -cd '0-9'
 }
 
-# 判断容器内 sshd 是否在监听：遍历 /proc/<pid>/root 指向容器的进程，cmdline 含 sshd。
+# 判断容器内 sshd 是否在运行：遍历 /proc/<pid>/root 指向容器的进程，判断 argv[0]。
 # 不依赖容器当前命名空间可见（容器常运行在独立 mount ns 里，本进程看不到其挂载）。
+# 必须按 argv[0]（或 -D 绝对路径）精确判断：
+#   - 早期实现用 “cmdline 含 sshd”，会把 sshd-session、sshd-auth 这类会话子进程
+#     也算作“正在监听”，容器重启后残留的会话进程会让 UI 误报 SSH 运行中；
+#   - 只认 sshd / */sshd / *sshd -D 这类主进程形态，保证状态与真实端口一致。
 sshd_running()
 {
-    local pid_dir pid target
+    local pid_dir pid target a0 a1
     target="${CHROOT_DIR%/}"
     [ -n "${target}" ] || return 1
     for pid_dir in /proc/[0-9]*
@@ -430,7 +443,16 @@ sshd_running()
         [ -r "${pid_dir}/cmdline" ] || continue
         pid="${pid_dir#/proc/}"
         [ "$(readlink "${pid_dir}/root" 2>/dev/null)" = "${target}" ] || continue
-        tr '\0' ' ' < "${pid_dir}/cmdline" 2>/dev/null | grep -q "sshd" && return 0
+        a0=$(tr '\0' '\n' < "${pid_dir}/cmdline" 2>/dev/null | head -1)
+        case "${a0}" in
+        sshd|*/sshd) return 0 ;;
+        esac
+        # 部分发行版以 “sshd -D ...”（a0=sshd 已覆盖）或被重命名的方式启动，
+        # 再按参数兜底一次（避免把 -session/-auth 子进程算进来）
+        a1=$(tr '\0' '\n' < "${pid_dir}/cmdline" 2>/dev/null | head -2 | tail -1)
+        case "${a1}" in
+        -D|-[Dd]*|--daemon) case "${a0}" in *sshd*|-sshd|*/sshd*) return 0 ;; esac ;;
+        esac
     done
     return 1
 }
@@ -474,6 +496,54 @@ remove_ldstatus_anchor()
     [ -n "${CURRENT_CONF}" ] || return 0
     rm -f "${CONFIG_DIR}/${CURRENT_CONF}.ldstatus" 2>/dev/null
     return 0
+}
+
+# 容器启动信息文件：App 每次执行 su -c 都处于独立的挂载命名空间，
+# 当前命名空间通常“看不到”容器挂载，直接读 CHROOT_DIR 会得到空目录或旧内容，
+# 导致 status 报 mounted=false、ssh_running=false，与界面/SSH 实际状态不一致。
+# 这里在容器启动（能看见挂载的一方）时把设备号与网络信息落盘，
+# status 在其余命名空间里据此还原，保证 UI 显示与真实 SSH 一致。
+ldinfo_file()
+{
+    [ -n "${CURRENT_CONF}" ] || return 1
+    echo "${CONFIG_DIR}/${CURRENT_CONF}.ldinfo"
+}
+
+# 写入启动信息（container_start 成功后调用）
+ldinfo_write()
+{
+    local f dev
+    f=$(ldinfo_file) || return 0
+    dev=$(stat -c %d "${CHROOT_DIR}" 2>/dev/null)
+    {
+        echo "DEV=${dev}"
+        echo "MOUNTS=$(is_mounted "${CHROOT_DIR}" && echo 1 || echo 0)"
+        echo "IPV4=$(host_ipv4)"
+        echo "AT=$(date '+%s')"
+    } > "${f}.tmp" 2>/dev/null && mv -f "${f}.tmp" "${f}" 2>/dev/null
+    chmod 644 "${f}" 2>/dev/null || true
+    return 0
+}
+
+# 读取启动信息字段（$1=键名），输出值；文件不存在输出空
+ldinfo_get()
+{
+    local f
+    f=$(ldinfo_file) || return 0
+    sed -n "s/^$1=//p" "${f}" 2>/dev/null | head -1
+}
+
+# 校验“记录的容器目录”确实是本次启动的容器：比较设备号。
+# 设备号不同说明配置改过 CHROOT_DIR（或目录被重建），旧信息不可信。
+ldinfo_valid()
+{
+    local f rec cur
+    f=$(ldinfo_file) || return 1
+    [ -s "${f}" ] || return 1
+    rec=$(ldinfo_get DEV)
+    [ -n "${rec}" ] || return 1
+    cur=$(stat -c %d "${CHROOT_DIR}" 2>/dev/null)
+    [ -n "${cur}" ] && [ "${rec}" = "${cur}" ]
 }
 
 # 检查 ldstatus 标记进程是否存活：锚点 pid + 进程名校验。
@@ -668,6 +738,152 @@ statx_shim_prepare()
     fi
     statx_shim_install || true
     return 0
+}
+
+# 错误捕获：CLI 顶层在非调试模式执行 exec 2>/dev/null，组件内命令的英文报错
+# 只到 stderr，既不进 UI 也不进日志文件，最终只剩一句“部署失败”，用户无从排查。
+# 这里在 stderr 上挂一份副本，统一加 "[错误]" 前缀写入日志文件；
+# 部署失败收尾时由 ld_log_tail_errors 把最后几条回显到 stdout（UI 日志页可见）。
+ld_capture_errors()
+{
+    [ -n "${LOG_FILE}" ] || return 0
+    # 实现方式：把 stderr 接到临时文件（不依赖进程替换，任何 POSIX shell 可用），
+    # 部署收尾时由 ld_collect_errors 把内容追加进日志并按需回显。
+    LD_ERR_CAPTURE="${TEMP_DIR}/ld-stderr.$$"
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || return 0
+    : > "${LD_ERR_CAPTURE}" 2>/dev/null || { LD_ERR_CAPTURE=""; return 0; }
+    exec 2>>"${LD_ERR_CAPTURE}"
+    return 0
+}
+
+# 收集 stderr 捕获内容：写入日志文件（带 [错误] 前缀），并输出最近 $1 行到 stdout
+ld_collect_errors()
+{
+    local n="${1:-6}" errs
+    [ -n "${LD_ERR_CAPTURE}" ] && [ -s "${LD_ERR_CAPTURE}" ] || return 0
+    # 过滤常见噪音：无 tty 提示、dpkg 的 crontab/fonts 警告等不影响结果的行
+    errs=$(grep -v -e 'not a tty' -e 'debconf: unable to initialize frontend' \
+        -e 'No such file or directory$' "${LD_ERR_CAPTURE}" 2>/dev/null | tail -n "${n}")
+    [ -n "${errs}" ] || errs=$(tail -n "${n}" "${LD_ERR_CAPTURE}" 2>/dev/null)
+    if [ -n "${LOG_FILE}" ] && [ -n "${errs}" ]; then
+        printf '%s\n' "${errs}" | while IFS= read -r _ld_line; do
+            printf '%s [错误] %s\n' "$(date '+%F %T')" "${_ld_line}" >> "${LOG_FILE}"
+        done
+    fi
+    [ -n "${errs}" ] && printf '%s\n' "${errs}"
+    return 0
+}
+
+# 清理 stderr 捕获状态（恢复默认 stderr 并删除临时文件）
+ld_capture_cleanup()
+{
+    [ -n "${LD_ERR_CAPTURE}" ] || return 0
+    exec 2>/dev/null
+    rm -f "${LD_ERR_CAPTURE}" 2>/dev/null
+    LD_ERR_CAPTURE=""
+    return 0
+}
+
+# 把日志文件里最近的错误行输出到 stdout（$1=条数，默认 5）
+ld_log_tail_errors()
+{
+    local n="${1:-5}" line
+    [ -s "${LOG_FILE}" ] || return 0
+    grep '\[错误\]' "${LOG_FILE}" 2>/dev/null | tail -n "${n}" | while IFS= read -r line; do
+        # 去掉日志行首的 "YYYY-MM-DD HH:MM:SS " 时间戳，避免与 UI 自身时间戳重复
+        echo "${line#* * }"
+    done
+}
+
+################################################################################
+# 容器内包管理器（统一入口）
+################################################################################
+#
+# 背景：这些安装函数最初只定义在 bootstrap/<发行版>/deploy.sh 里。
+# 部署流程分两段执行（先 bootstrap 生成 rootfs，再执行 core/extra/init 等组件），
+# 两段各自在独立子 shell 中运行，函数不会跨段保留。因此 core/hostname、
+# extra/ssh、desktop/*、init/systemctl 等组件调用 apt_install 时，
+# 会直接报 “apt_install: inaccessible or not found”（4.1.20 实测：
+# Debian 部署在 extra/ssh 安装阶段失败）。
+# 这里把安装函数下沉到 CLI 公共层，任何组件在任何阶段都能调用；
+# bootstrap 组件内的同名定义已删除，避免两处实现不一致。
+
+# Debian 系（debian/ubuntu/kali）：apt-get 更新索引并安装
+apt_install()
+{
+    local packages
+    packages="$@"
+    [ -n "${packages}" ] || return 1
+    (set -e
+        log_exec chroot_exec -u root apt-get update -yq
+        log_exec chroot_exec -u root "DEBIAN_FRONTEND=noninteractive apt-get install -yfq --no-install-recommends ${packages}"
+        log_exec chroot_exec -u root apt-get clean
+    exit 0)
+    return $?
+}
+
+# Arch Linux：pacman 同步索引并安装（覆盖已有文件以避免包冲突中断）
+pacman_install()
+{
+    local packages
+    packages="$@"
+    [ -n "${packages}" ] || return 1
+    (set -e
+        chroot_exec -u root pacman -Syq --overwrite="*" --noconfirm ${packages}
+        rm -f "${CHROOT_DIR}"/var/cache/pacman/pkg/* || true
+    exit 0)
+    return $?
+}
+
+# Alpine：apk 更新索引并安装
+apk_install()
+{
+    local packages
+    packages="$@"
+    [ -n "${packages}" ] || return 1
+    (set -e
+        chroot_exec -u root apk update || true
+        chroot_exec -u root apk add --no-progress ${packages}
+    exit 0)
+    return $?
+}
+
+# Fedora：dnf 安装
+dnf_install()
+{
+    local packages
+    packages="$@"
+    [ -n "${packages}" ] || return 1
+    (set -e
+        chroot_exec -u root dnf -y install ${packages}
+    exit 0)
+    return $?
+}
+
+# CentOS：yum 安装
+yum_install()
+{
+    local packages
+    packages="$@"
+    [ -n "${packages}" ] || return 1
+    (set -e
+        chroot_exec -u root yum install ${packages} --nogpgcheck --skip-broken -y
+        chroot_exec -u root yum clean all
+    exit 0)
+    return $?
+}
+
+# Slackware：slackpkg 安装
+slackpkg_install()
+{
+    local packages
+    packages="$@"
+    [ -n "${packages}" ] || return 1
+    (set -e
+        chroot_exec -u root "yes | slackpkg -checkgpg=off -batch=on -default_answer=y update" || true
+        chroot_exec -u root "yes | slackpkg -checkgpg=off -batch=on -default_answer=y install ${packages}"
+    exit 0)
+    return $?
 }
 
 # 把参数按 POSIX 单引号规则转义，供容器内 sh -c 安全还原。
@@ -872,10 +1088,15 @@ config_exists()
 }
 
 # 获取当前配置的 CHROOT_DIR 默认值（隔离目录）
+# 注意：默认值必须是“设备端”可写且可执行的系统目录 /data/local/tmp。
+# 早期默认放在 BUILD_DIR（见下方 BUILD_DIR 定义），而 BUILD_DIR 会按
+# ENV_DIR 推导成 /data/data/<包名>/files/builds —— 该目录对 root 虽然可写，
+# 但在部分 ROM 上受应用数据目录权限/SELinux 约束，容器内服务（sshd 等）
+# 读取 host key 与 /etc/shadow 时出现 EACCES，表现为“能启动但 SSH 不接受密码”。
+# 与 App 推荐路径（StorageValidator）保持一致，均为 /data/local/tmp/<配置名>。
 config_default_chroot_dir()
 {
-    # 容器目录默认放在项目 builds 目录下（与源码、缓存、日志分离）
-    echo "${BUILD_DIR:-${ENV_DIR}/mnt}/$1"
+    echo "${LINUX_DEPLOY_DATA_DIR:-/data/local/tmp}/$1"
 }
 
 # 列出全部配置
@@ -1009,9 +1230,14 @@ config_create()
     # 默认 INCLUDE 含 init 组件：启动容器时执行初始化脚本（默认 SysV，见 INIT 键）
     INCLUDE="${INCLUDE:-bootstrap init}"
     METHOD="${METHOD:-chroot}"
-    # 初始化系统默认 SysV：start 时执行 /etc/rc3.d/ 的 S 脚本（Debian 系布局）
-    INIT="${INIT:-sysv}"
+    # 初始化系统默认：Debian 系用 SysV（/etc/rc3.d），其余发行版用 run-parts
+    # （/etc/rc.d，见主流程 INIT 兜底说明：非 Debian 系没有 rcN.d 布局）
+    case "${DISTRIB}" in
+    debian|ubuntu|kali) INIT="${INIT:-sysv}" ;;
+    *) INIT="${INIT:-run-parts}" ;;
+    esac
     INIT_LEVEL="${INIT_LEVEL:-3}"
+    [ -n "${INIT_PATH}" ] || INIT_PATH="/etc/rc.d"
     USER_NAME="${USER_NAME:-root}"
     USER_PASSWORD="${USER_PASSWORD:-changeme}"
     USER_GROUPS="${USER_GROUPS:-aid_inet aid_sdcard_rw aid_graphics}"
@@ -1108,7 +1334,7 @@ config_delete()
     else
         confirm_yes "确认删除该配置（容器目录数据保留）？" || { msg "已取消。"; return 1; }
     fi
-    rm -f "${conf_file}" "${CONFIG_DIR}/${name}.ldstatus"
+    rm -f "${conf_file}" "${CONFIG_DIR}/${name}.ldstatus" "${CONFIG_DIR}/${name}.ldinfo"
     msg "已删除配置: ${name}"
 }
 
@@ -1701,13 +1927,18 @@ mount_part()
     ;;
     pts)
         msg -n "/dev/pts ... "
-        if ! is_mounted "/dev/pts" ; then
-            [ -d "/dev/pts" ] || mkdir -p /dev/pts
-            mount -o rw,nosuid,noexec,gid=5,mode=620,ptmxmode=000 -t devpts devpts /dev/pts
-        fi
-        local target="${CHROOT_DIR}/dev/pts"
-        if ! is_mounted "${target}" ; then
-            mount -o bind /dev/pts "${target}"
+        local pts_target="${CHROOT_DIR}/dev/pts"
+        if ! is_mounted "${pts_target}" ; then
+            # devpts 已挂载（宿主或上一次容器会话）时直接 bind；
+            # 否则先在容器内挂一份 devpts，失败再退回 bind 宿主 /dev/pts
+            if ! is_mounted "/dev/pts" ; then
+                [ -d "/dev/pts" ] || mkdir -p /dev/pts
+                mount -o rw,nosuid,noexec,gid=5,mode=620,ptmxmode=000 -t devpts devpts "${pts_target}" 2>/dev/null || true
+            fi
+            if ! is_mounted "${pts_target}" ; then
+                [ -d "${pts_target}" ] || mkdir -p "${pts_target}"
+                mount -o bind /dev/pts "${pts_target}"
+            fi
             is_ok "失败" "完成" || return 1
         else
             msg "跳过"
@@ -1795,8 +2026,9 @@ container_umount()
     local pids
     pids=$(get_pids)
     kill_pids ${pids}; is_ok "失败" "完成"
-    # 进程已结束：清掉配置侧 ldstatus 锚点，避免 status 继续判定"运行中"
+    # 进程已结束：清掉配置侧 ldstatus 锚点与启动信息，避免 status 继续判定"运行中"
     remove_ldstatus_anchor
+    [ -n "${CURRENT_CONF}" ] && rm -f "${CONFIG_DIR}/${CURRENT_CONF}.ldinfo" 2>/dev/null
 
     msg "正在卸载分区: "
     local is_mnt=0
@@ -1921,6 +2153,8 @@ container_start()
     else
         component_exec "${INCLUDE}" || msg "[警告] 部分组件启动失败（容器已启动，可进入终端检查）"
     fi
+    # 启动信息落盘：供其它命名空间下的 status 还原运行/网络状态（UI 与 SSH 一致）
+    ldinfo_write
     return 0
 }
 
@@ -2170,7 +2404,8 @@ container_status()
         local installed="未知" supported_fs="" ipv4=""
         if command -v getprop >/dev/null 2>&1; then
             model=$(getprop ro.product.model 2>/dev/null)
-            android=$(getprop ro.build.version.release 2>/dev/null)
+            android=$(getprop build.version.release 2>/dev/null)
+            [ -n "${android}" ] || android=$(getprop ro.build.version.release 2>/dev/null)
         fi
         arch=$(uname -m)
         kernel=$(uname -r)
@@ -2184,16 +2419,27 @@ container_status()
         loop_support && loop=true
         multiarch_support && binfmt=true
         supported_fs=$(printf '%s ' $(grep -v nodev /proc/filesystems | sort))
+        # running 判定：ldstatus 标记进程（跨命名空间）为主，挂载兜底（旧容器无标记）
+        container_mounted >/dev/null 2>&1 && mounted=true
+        [ "${mounted}" = "true" ] && running=true
+        ldstatus_running && running=true
+        # App 每次 su -c 都在独立挂载命名空间：当前命名空间通常看不到容器挂载，
+        # 直接用 CHROOT_DIR 读 os-release / 遍历进程都会得到错误结果
+        # （UI 显示“已停止/SSH 未运行”，但容器实际在跑、SSH 也能连）。
+        # 启动时已把容器设备号与网络信息写入 ${CONFIG_DIR}/<配置名>.ldinfo，
+        # 这里优先据此判定 mounted / ipv4，保证 UI 与真实状态一致。
+        if ldinfo_valid; then
+            [ "$(ldinfo_get MOUNTS)" = "1" ] && mounted=true
+            running=true
+            [ -n "${ipv4}" ] || ipv4=$(ldinfo_get IPV4)
+        fi
         if [ -r "${CHROOT_DIR}/etc/os-release" ]; then
             # 参数化读取 PRETTY_NAME（不用 . source：os-release 来自导入的
             # rootfs，内容外部可控，source 会执行其中任意 shell 代码）
             installed=$(grep '^PRETTY_NAME=' "${CHROOT_DIR}/etc/os-release" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
             [ -n "${installed}" ] || installed="未知"
         fi
-        # running 判定：ldstatus 标记进程（跨命名空间）为主，挂载兜底（旧容器无标记）
-        container_mounted >/dev/null 2>&1 && mounted=true
-        [ "${mounted}" = "true" ] && running=true
-        ldstatus_running && running=true
+        [ -n "${ipv4}" ] || ipv4=$(host_ipv4)
         # ssh 独立判定（供前端显示/排障：容器运行但 sshd 未起时能直接看出来）
         local ssh_enabled=false ssh_running=false
         case " ${INCLUDE:-} " in *" extra/ssh "*) ssh_enabled=true ;; esac
@@ -2281,9 +2527,14 @@ container_status()
     container_mounted >/dev/null 2>&1 && mounted=true
     [ "${mounted}" = "true" ] && running=true
     ldstatus_running && running=true
+    # 命名空间不可见时按启动信息还原（见 container_status --json 分支说明）
+    if ldinfo_valid; then
+        running=true
+    fi
     [ "${running}" = "true" ] && msg "运行中" || msg "已停止"
     msg -n "局域网 IPv4: "
     local lan_ip=$(host_ipv4)
+    [ -n "${lan_ip}" ] || lan_ip=$(ldinfo_get IPV4)
     [ -n "${lan_ip}" ] && msg "${lan_ip}" || msg "未连接网络"
     case " ${INCLUDE:-} " in
     *" extra/ssh "*)
@@ -2578,10 +2829,16 @@ if [ -z "${ENV_DIR}" ]; then
     ENV_DIR=$(dirname "$(readlink -f "$0")")
 fi
 # 项目根目录（ENV_DIR 为 <项目根>/src/linuxdeploy-cli）与构建目录：
-# 容器部署产物统一放在 builds 下，与源码、缓存、日志分离
+# 容器部署产物统一放在 builds 下，与源码、缓存、日志分离。
+# 注意：BUILD_DIR 仅用于日志/临时文件；容器目录默认值见 LINUX_DEPLOY_DATA_DIR
+# 的说明（必须是设备端系统目录，不能落在应用数据目录）。
 PROJECT_ROOT=$(dirname "$(dirname "${ENV_DIR}")")
 if [ -z "${BUILD_DIR}" ]; then
-    BUILD_DIR="${PROJECT_ROOT}/builds"
+    # 安卓宿主 /data/data/<包名>/... 不可用时退回到设备公共目录
+    case "${ENV_DIR}" in
+    /data/data/*|/data/user/*|/data/user_de/*) BUILD_DIR="/data/local/tmp/linuxdeploy/builds" ;;
+    *) BUILD_DIR="${PROJECT_ROOT}/builds" ;;
+    esac
 fi
 # 读取环境全局配置（可覆盖以下默认目录）
 if [ -e "${ENV_DIR}/cli.conf" ]; then
@@ -2832,10 +3089,23 @@ fi
 # 固定启动方式为 chroot（unshare 暂不支持，4.0 目标）
 METHOD="chroot"
 
-# 初始化系统兜底：旧配置可能无 INIT 键，统一默认 sysv（Debian 系 /etc/rcN.d 布局）；
+# 初始化系统兜底：旧配置可能无 INIT 键。
+# - Debian 系（debian/ubuntu/kali）默认 sysv（/etc/rcN.d 布局）；
+# - 非 Debian 系必须默认 run-parts（/etc/rc.d，与 Ubuntu 模板的标准脚本一致）：
+#   Alpine 没有 /etc/rcN.d，Arch/Slackware 的服务脚本都在 /etc/rc.d；
+#   若沿用 sysv，启动时 “/etc/rc3.d 不存在” 直接跳过，sshd 永远不会被拉起，
+#   表现为“容器显示运行中，但 SSH 连不上”（沿用 Ubuntu 上验证过的修复方式）。
 # INCLUDE 含 init 组件时组件依赖解析依赖 INIT 值，缺省会直接报"缺少必要参数"。
-INIT="${INIT:-sysv}"
+if [ -z "${INIT}" ]; then
+    case "${DISTRIB}" in
+    debian|ubuntu|kali) INIT="sysv" ;;
+    *) INIT="run-parts" ;;
+    esac
+fi
 INIT_LEVEL="${INIT_LEVEL:-3}"
+if [ "${INIT}" = "run-parts" ] && [ -z "${INIT_PATH}" ]; then
+    INIT_PATH="/etc/rc.d"
+fi
 
 # 常驻显示操作配置（--json 模式隐藏横幅，避免污染机器可读输出）
 if [ "${JSON_MODE}" != "true" ]; then
@@ -2898,6 +3168,8 @@ deploy)
     require_config
     # 部署 -c 指定配置
     log_open "${CURRENT_CONF:-deploy}"
+    # 组件内部命令的 stderr 副本写入日志（失败收尾时回显，T13 修复失败不可见问题）
+    ld_capture_errors
     dry_run="false"
     yes_mode="false"
     mount_flag="false"
@@ -3012,9 +3284,21 @@ deploy)
                 msg "部署失败，正在卸载残留挂载 ..."
                 container_umount >/dev/null 2>&1 || true
             fi
+            # 失败原因回显：组件内命令的报错原本只走 stderr（UI 看不到），
+            # 这里把捕获到的 stderr 写入日志并回显到输出末尾，UI 日志页可直接定位。
+            _ld_errs=$(ld_collect_errors 6)
+            if [ -n "${_ld_errs}" ]; then
+                msg "部署失败，最近的错误信息："
+                printf '%s\n' "${_ld_errs}"
+            fi
+            ld_capture_cleanup
+            msg "部署未完成（退出码 ${rc}），完整日志: ${LOG_FILE}"
         elif [ "${keep_mounted}" != "true" ] && container_mounted >/dev/null 2>&1; then
             msg "部署完成，正在卸载容器挂载（可用 start 启动）..."
+            ld_capture_cleanup
             container_umount >/dev/null 2>&1 || true
+        else
+            ld_capture_cleanup
         fi
         return ${rc}
     }

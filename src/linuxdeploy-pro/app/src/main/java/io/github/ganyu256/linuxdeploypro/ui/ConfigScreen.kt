@@ -88,12 +88,12 @@ private val DISTRO_LABELS = mapOf(
  *   main/universe/multiverse 组件齐全）。
  */
 private val DISTRO_MIRRORS = mapOf(
-    "debian" to "http://mirrors.ustc.edu.cn/debian/",
-    "ubuntu" to "http://mirrors.aliyun.com/ubuntu-ports/",
-    "kali" to "http://mirrors.ustc.edu.cn/kali/",
-    "alpine" to "http://mirrors.tuna.tsinghua.edu.cn/alpine/",
-    "archlinux" to "http://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/",
-    "slackware" to "http://mirrors.ustc.edu.cn/slackware/",
+    "debian" to "https://mirrors.ustc.edu.cn/debian/",
+    "ubuntu" to "https://mirrors.aliyun.com/ubuntu-ports/",
+    "kali" to "https://mirrors.ustc.edu.cn/kali/",
+    "alpine" to "https://mirrors.tuna.tsinghua.edu.cn/alpine/",
+    "archlinux" to "https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/",
+    "slackware" to "https://mirrors.ustc.edu.cn/slackware/",
     "rootfs" to "",
 )
 
@@ -533,14 +533,24 @@ fun ConfigScreen(
                 ),
             ) {
                 Column {
-                    // systemctl（init 模式）依赖 python3 + systemd 风格 unit：
-                    // Debian 系（debian/ubuntu/kali）自带 python3；CentOS 组件已废弃、
-                    // 界面不提供该发行版。Alpine 用 OpenRC，Arch/Slackware 不保证
-                    // systemd unit 与 python3，因此这些发行版只保留 SysV/run-parts。
+                    // 初始化系统按发行版提供（与 CLI 组件的真实支持范围一致）：
+                    // - systemctl（init 模式）依赖 python3 + systemd 风格 unit：
+                    //   Debian 系（debian/ubuntu/kali）自带 python3，可直接选用；
+                    // - Alpine 用 OpenRC（rc-update/rc-service）；
+                    // - 其余（Arch/Slackware）只有 /etc/rc.d 脚本，用 run-parts；
+                    // - SysV（/etc/rcN.d）仅 Debian 系存在，其他系统选了也拉不起服务
+                    //   （曾表现为“容器显示运行中、SSH 连不上”），因此不再提供。
                     val systemctlCapable = distro in listOf("debian", "ubuntu", "kali")
                     val openrcCapable = distro == "alpine"
-                    val initItems = mutableListOf("SysV（/etc/rcN.d）", "run-parts（自定义目录）")
-                    val initValues = mutableListOf("sysv", "run-parts")
+                    val sysvCapable = distro in listOf("debian", "ubuntu", "kali")
+                    val initItems = mutableListOf<String>()
+                    val initValues = mutableListOf<String>()
+                    if (sysvCapable) {
+                        initItems.add("SysV（/etc/rcN.d）")
+                        initValues.add("sysv")
+                    }
+                    initItems.add("run-parts（/etc/rc.d）")
+                    initValues.add("run-parts")
                     if (systemctlCapable) {
                         initItems.add("systemctl（init 模式）")
                         initValues.add("systemctl")
@@ -549,12 +559,15 @@ fun ConfigScreen(
                         initItems.add("OpenRC（openrc default）")
                         initValues.add("openrc")
                     }
-                    // 发行版不支持所选初始化系统时回落为 sysv
-                    val displayInit = if (initSystem in initValues) initSystem else "sysv"
+                    // 发行版不支持所选初始化系统时回落：Debian 系 sysv，其余 run-parts
+                    val fallbackInit = if (sysvCapable) "sysv" else "run-parts"
+                    val displayInit = if (initSystem in initValues) initSystem else fallbackInit
+                    // 宿主机上配置值与回落后不一致时同步回状态，避免保存出不可用组合
+                    if (displayInit != initSystem) initSystem = displayInit
                     OverlayDropdownPreference(
                         title = "初始化系统",
                         summary = when (displayInit) {
-                            "run-parts" -> "run-parts（自定义脚本目录）"
+                            "run-parts" -> "run-parts（/etc/rc.d 服务脚本）"
                             "systemctl" -> "systemctl（init 模式，拉起 default.target 服务）"
                             "openrc" -> "OpenRC（Alpine 默认，等价 rc-service --all）"
                             else -> "SysV（/etc/rcN.d，Debian 默认）"

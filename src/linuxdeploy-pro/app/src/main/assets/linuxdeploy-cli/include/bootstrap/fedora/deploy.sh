@@ -18,17 +18,7 @@ fi
 
 [ -n "${SOURCE_PATH}" ] || SOURCE_PATH="http://dl.fedoraproject.org/pub/"
 
-dnf_install()
-{
-    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
-    local packages
-    packages="$@"
-    [ -n "${packages}" ] || return 1
-    (set -e
-        chroot_exec -u root dnf -y install ${packages}
-    exit 0)
-    return $?
-}
+# dnf 安装函数已下沉到 cli.sh 公共层（bootstrap 与后续组件共用），此处不再重复定义。
 
 do_install()
 {

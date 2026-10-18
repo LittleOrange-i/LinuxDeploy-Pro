@@ -53,7 +53,8 @@ do_start()
 do_stop()
 {
     local services
-    services=$(openrc_services | tac)
+    # 逆序停止不依赖 tac（Alpine 默认 busybox 无该 applet），改用 awk 倒序输出
+    services=$(openrc_services | awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}')
     [ -n "${services}" ] || return 0
     msg ":: 停止 OpenRC 服务："
     local item

@@ -38,29 +38,20 @@ fi
 # - sudo：权限管理
 # - man-db：手册数据库
 # - python3：systemctl（python 实现）运行依赖
-# 注意：debootstrap 一阶段只索引 main 分区，universe 里的包（如 fish）会报
-# "E: Couldn't find these debs: fish" 直接中断部署；这类包放到二阶段
-# 配好 main/universe/multiverse 源后再用 apt 安装（见 do_install）。
-BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3,hostname,tzdata"
+# 注意：
+# 1) Ubuntu 官方 rootfs 默认自带 hostname/tzdata，重复列入只会拖慢下载；
+# 2) --include 只能取 main 分区（debootstrap 一阶段只索引 main），
+#    universe 包（如 fish）会被报 "E: Couldn't find these debs" 直接中断部署，
+#    这类包放到二阶段配好 main/universe/multiverse 源后再用 apt 安装（见 do_install）；
+# 3) fish 属于可选增强：镜像站 universe 未同步时 apt 安装失败不应让整个部署失败。
+BASE_INCLUDE_PACKAGES="locales,sudo,man-db,python3,tzdata"
 # 排除包清单（容器内不需要 init 与 systemd 引导）
 BASE_EXCLUDE_PACKAGES="init,systemd-sysv"
 # 一阶段完成后额外安装的包（依赖 non-main 分区，需先配好完整 apt 源）
 BASE_UNIVERSE_PACKAGES="fish"
 
-# apt 安装辅助函数：更新索引并静默安装指定包（与 bootstrap/debian 相同）
-apt_install()
-{
-    # mksh 的 local 不接受以 "$@" 直接赋值（会把包名当变量名报错）
-    local packages
-    packages="$@"
-    [ -n "${packages}" ] || return 1
-    (set -e
-        log_exec chroot_exec -u root apt-get update -yq
-        log_exec chroot_exec -u root "DEBIAN_FRONTEND=noninteractive apt-get install -yfq --no-install-recommends ${packages}"
-        log_exec chroot_exec -u root apt-get clean
-    exit 0)
-    return $?
-}
+# apt 安装函数 apt_install 已下沉到 cli.sh 公共层（bootstrap 与后续组件共用），
+# 此处不再重复定义，避免两处实现不一致。
 
 # 确保容器内核心虚拟文件系统可用（与 bootstrap/debian 相同）
 # debootstrap 二阶段结束退出时，会自动卸载 /proc、/sys、/dev、/dev/shm、/dev/pts，
@@ -94,9 +85,41 @@ apt_repository()
     if [ ! -s "${CHROOT_DIR}/etc/resolv.conf" ]; then
         cp /etc/resolv.conf "${CHROOT_DIR}/etc/resolv.conf" 2>/dev/null || true
     fi
-    # 写入正式软件源
-    echo "deb ${SOURCE_PATH} ${SUITE} main universe multiverse" > "${CHROOT_DIR}/etc/apt/sources.list"
-    echo "deb-src ${SOURCE_PATH} ${SUITE} main universe multiverse" >> "${CHROOT_DIR}/etc/apt/sources.list"
+    # 写入正式软件源。
+    # Ubuntu 24.04（noble）起 deb822 格式（/etc/apt/sources.list.d/ubuntu.sources）是
+    # 官方默认，旧的单行 sources.list 仍被支持；但若两者同时存在，重复的源会在
+    # apt update 时产生 "Target Packages is configured multiple times" 告警。
+    # 这里统一改用 deb822 覆盖官方源文件，并清空旧 sources.list，避免两份源打架。
+    local src="${SOURCE_PATH%/}"
+    local suites="${SUITE} ${SUITE}-updates ${SUITE}-security"
+    local components="main universe multiverse restricted"
+    mkdir -p "${CHROOT_DIR}/etc/apt/sources.list.d"
+    {
+        echo "Types: deb"
+        echo "URIs: ${src}/"
+        echo "Suites: ${suites}"
+        echo "Components: ${components}"
+        echo "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
+    } > "${CHROOT_DIR}/etc/apt/sources.list.d/ubuntu.sources"
+    # 无签名的第三方/镜像源（archive 未同步 keyring）不做强校验：仅在源为 http 时放宽，
+    # 避免部分镜像站 Release 签名缺失导致 apt update 整体失败
+    case "${src}" in
+    http://*) sed -i '/^Signed-By:/d' "${CHROOT_DIR}/etc/apt/sources.list.d/ubuntu.sources" ;;
+    esac
+    : > "${CHROOT_DIR}/etc/apt/sources.list"
+    # 后端已固化的旧配置：删除重复的官方源文件（保留用户自定义源）
+    local f
+    for f in "${CHROOT_DIR}"/etc/apt/sources.list.d/*.list "${CHROOT_DIR}"/etc/apt/sources.list.d/*.sources
+    do
+        [ -f "${f}" ] || continue
+        case "${f##*/}" in
+        ubuntu.sources) continue ;;
+        esac
+        # 只清理指向 Ubuntu 官方/典型镜像的源文件，避免误删用户自建源
+        if grep -Eq 'ubuntu\.com|ubuntu-ports|aliyun\.com|tuna\.tsinghua|ustc\.edu\.cn|mirrors\.' "${f}" 2>/dev/null; then
+            rm -f "${f}"
+        fi
+    done
 }
 
 # 安装主流程：debootstrap 一阶段（解包）+ 二阶段（chroot 内配置）
@@ -203,11 +226,12 @@ do_install()
     is_ok || msg "[警告] command-not-found 安装失败（不影响容器使用）"
 
     # 安装非 main 分区的默认包（fish 在 universe）。此处在完整源配置后执行，
-    # 失败不阻断部署：基础系统已可用，shell 缺失只需手动 apt install 补装。
+    # 失败不阻断部署：fish 属可选增强（部分镜像站未同步 universe），
+    # 基础系统与 SSH 已可用，缺 shell 只需手动 apt install 补装即可。
     if [ -n "${BASE_UNIVERSE_PACKAGES}" ]; then
-        msg "正在安装 ${BASE_UNIVERSE_PACKAGES} ..."
+        msg "正在安装 ${BASE_UNIVERSE_PACKAGES}（可选）..."
         apt_install ${BASE_UNIVERSE_PACKAGES}
-        is_ok || msg "[警告] ${BASE_UNIVERSE_PACKAGES} 安装失败（可在容器内执行 apt install 补装）"
+        is_ok || msg "[提示] ${BASE_UNIVERSE_PACKAGES} 安装失败（可选组件，不影响系统与 SSH 使用）"
     fi
 
     # 安装额外软件包（可选，CLI 命令行参数仍支持）
