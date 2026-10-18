@@ -6,9 +6,18 @@
 [ -n "${USER_PASSWORD}" ] || USER_PASSWORD="changeme"
 
 # 判断容器内是否具备 chpasswd
+# 说明：旧实现用 `chroot_exec -u root /bin/sh -c 'command -v chpasswd ...'` 探测，
+# 该命令串经 su -c 二次拼接后引号丢失，容器内实际只执行了 shell 内建 `command`
+# （无参数恒返回 0），于是"探测永远为真"：容器真的缺 chpasswd 时会误走 chpasswd
+# 分支并直接报错，openssl 兜底路径永不生效。这里改为按可执行文件探测，
+# 结果与发行版无关（Debian/Alpine/Arch 等一致）。
 profile_has_chpasswd()
 {
-    chroot_exec -u root /bin/sh -c 'command -v chpasswd >/dev/null 2>&1' >/dev/null 2>&1
+    local p
+    for p in /usr/sbin/chpasswd /usr/bin/chpasswd /sbin/chpasswd /bin/chpasswd; do
+        [ -x "${CHROOT_DIR}${p}" ] && return 0
+    done
+    return 1
 }
 
 # 无 chpasswd 时的兜底：用容器内 openssl passwd 生成哈希并写入 /etc/shadow。
@@ -19,10 +28,14 @@ profile_set_password_shadow()
     local user="${USER_NAME}" pass="${USER_PASSWORD}" shadow hash
     shadow="${CHROOT_DIR}/etc/shadow"
     [ -r "${shadow}" ] || return 1
-    hash=$(chroot_exec -u root /bin/sh -c "openssl passwd -6 '${pass}' 2>/dev/null") || true
+    # 直接以参数形式把密码交给容器内 openssl（chroot_exec 用 "$@" 保留参数边界，
+    # 不经 shell 二次解析，密码含引号/空格/特殊字符也安全）。
+    # 旧实现用 `chroot_exec -u root /bin/sh -c "openssl passwd -6 '${pass}'"`：
+    # su -c 拼接后引号丢失，openssl 实际拿不到密码，兜底路径形同虚设。
+    hash=$(chroot_exec openssl passwd -6 "${pass}" 2>/dev/null) || true
     case "${hash}" in
     '$6$'*) ;;
-    *) hash=$(chroot_exec -u root /bin/sh -c "openssl passwd -1 '${pass}' 2>/dev/null") || true ;;
+    *) hash=$(chroot_exec openssl passwd -1 "${pass}" 2>/dev/null) || true ;;
     esac
     case "${hash}" in
     '$'*) ;;
@@ -49,11 +62,17 @@ profile_set_password()
         msg "[错误] 容器内缺少 /etc/shadow，无法设置密码"
         return 1
     fi
-    # chpasswd 读取 "用户:密码"（stdin 经 chroot_exec 透传）
+    # chpasswd 读取 "用户:密码"（stdin 经 chroot_exec 透传）。
+    # 优先直接以 root 在容器内执行（不经 su/PAM）：su 会走一遍 PAM（core/su 还会
+    # 改写 /etc/pam.d/su），部分发行版/精简系统上会让 stdin 透传或会话初始化异常，
+    # 表现为"密码没生效但也不报错"。直接 chroot 执行不依赖 PAM，全发行版一致；
+    # 失败时再退回经 su 执行一次（兼容需要 root 登录会话的少数发行版）。
     if profile_has_chpasswd; then
-        if ! printf '%s:%s\n' "${user}" "${pass}" | chroot_exec -u root chpasswd; then
-            msg "[错误] chpasswd 执行失败，无法为 ${user} 设置密码"
-            return 1
+        if ! printf '%s:%s\n' "${user}" "${pass}" | chroot_exec chpasswd; then
+            if ! printf '%s:%s\n' "${user}" "${pass}" | chroot_exec -u root chpasswd; then
+                msg "[错误] chpasswd 执行失败，无法为 ${user} 设置密码"
+                return 1
+            fi
         fi
     else
         # Alpine 精简镜像/部分 Arch 容器没有 chpasswd，走 openssl 哈希兜底

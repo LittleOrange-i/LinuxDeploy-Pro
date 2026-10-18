@@ -690,8 +690,13 @@ fun MainScreen(
             }
             withContext(Dispatchers.Main.immediate) {
                 if (cfg != null) {
-                    detailConfig = cfg
+                    // 文件里没有运行态（running/sshRunning/ipv4 解析出来恒为默认值），
+                    // 直接用会让详情页把运行中的容器显示成"已停止 / SSH 未运行（容器已停止）"。
+                    // 这里合并列表页已查到的实时状态，并在进入后主动刷新一次，
+                    // 保证详情页状态与真实运行状态一致（与发行版无关）。
+                    detailConfig = cfg.withRuntimeStateFrom(configs)
                     pushRoute("detail:$name")
+                    refreshOneConfig(name)
                 } else {
                     Toast.makeText(context, "配置不存在或读取失败：$name", Toast.LENGTH_SHORT).show()
                     reloadConfigs()
@@ -718,7 +723,9 @@ fun MainScreen(
             }
             withContext(Dispatchers.Main.immediate) {
                 if (cfg != null) {
-                    detailConfig = cfg
+                    // 同 openDetail：编辑页保存时会带上 running 字段，需保留实时状态，
+                    // 否则保存后列表/详情会闪回"已停止"
+                    detailConfig = cfg.withRuntimeStateFrom(configs)
                     pushRoute("edit:$name")
                 } else {
                     Toast.makeText(context, "配置不存在或读取失败：$name", Toast.LENGTH_SHORT).show()
@@ -1057,6 +1064,18 @@ private fun OpProgressBanner(
             modifier = Modifier.fillMaxWidth().height(2.dp),
         )
     }
+}
+
+/**
+ * 用配置列表里同名的实时状态补齐"从配置文件解析出来的"配置。
+ *
+ * 配置文件只描述静态参数，解析结果里 running / sshRunning / ipv4 恒为默认值；
+ * 详情页直接使用会把正在运行的容器显示成"已停止 / SSH 未运行（容器已停止）"。
+ * 列表页条目带有 CLI 查询到的实时状态，这里按名称合并，保证页面状态与真实一致。
+ */
+private fun ContainerConfig.withRuntimeStateFrom(list: List<ContainerConfig>): ContainerConfig {
+    val live = list.firstOrNull { it.name == name } ?: return this
+    return copy(running = live.running, sshRunning = live.sshRunning, ipv4 = live.ipv4)
 }
 
 /** 日志列表保存器：进程重建后仍保留（String 行，无需结构解析） */

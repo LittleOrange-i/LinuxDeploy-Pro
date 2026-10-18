@@ -721,7 +721,9 @@ fun ConfigScreen(
                             },
                             sshEnabled = sshEnabled,
                             sshPort = sshPortState.text.toString().trim().ifBlank { "22" },
-                            password = passwordState.text.toString().ifBlank { "changeme" },
+                            // 密码与其他文本字段一致做 trim：输入法/粘贴容易带首尾空格，
+                            // 保存后写入 USER_PASSWORD 会跟着带空格，表现为"输对了密码仍被拒"
+                            password = passwordState.text.toString().trim().ifBlank { "changeme" },
                             components = buildComponents(),
                             init = initSystem,
                             initLevel = initLevelState.text.toString().trim().ifBlank { "3" },

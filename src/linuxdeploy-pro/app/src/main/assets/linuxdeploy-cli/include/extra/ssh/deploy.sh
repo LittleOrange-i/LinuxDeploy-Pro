@@ -51,6 +51,12 @@ ssh_config_file_apply()
     # 部分精简发行版模板默认禁止空密码账号，这里放宽（root 密码由 core/profile 设置）
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*PermitEmptyPasswords[[:space:]].*/PermitEmptyPasswords yes/' "${cfg}" 2>/dev/null || true
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*UsePAM[[:space:]].*/UsePAM yes/' "${cfg}" 2>/dev/null || true
+    # 键盘交互认证：Debian 系模板显式写了 KbdInteractiveAuthentication no，
+    # 部分客户端会优先协商该方式（UsePAM 下同样走 PAM 校验密码），关闭时
+    # 表现为"能连上但密码被拒"。这里与密码认证一起放开，保证各发行版行为一致；
+    # 旧版 OpenSSH（Ubuntu 20.04 等）用 ChallengeResponseAuthentication 同名选项。
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication[[:space:]].*/KbdInteractiveAuthentication yes/' "${cfg}" 2>/dev/null || true
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*ChallengeResponseAuthentication[[:space:]].*/ChallengeResponseAuthentication yes/' "${cfg}" 2>/dev/null || true
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*AcceptEnv[[:space:]].*/AcceptEnv LANG/' "${cfg}" 2>/dev/null || true
     # 端口写回配置文件（systemctl 模式经 ssh.service 启动时没有 -p 参数）
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*Port[[:space:]].*/Port '"${SSH_PORT}"'/' "${cfg}" 2>/dev/null || true
@@ -200,10 +206,13 @@ do_configure()
 do_start()
 {
     msg -n ":: Starting ${COMPONENT} ... "
+    # 每次启动重新应用一次 sshd 配置（端口 / 密码登录 / root 登录 / 键盘交互 /
+    # privsep 目录 / host key）：do_configure 只在部署时执行，历史容器、
+    # 或"改了密码/端口后重启容器"的场景需要靠这里兜底。旧实现仅 systemctl
+    # 模式生效，sysv/run-parts/OpenRC 下配置不刷新（表现为改了密码仍连不上）。
+    ssh_config_apply >/dev/null 2>&1
     # systemctl 模式：ssh 由 systemctl 管理（ssh.service / sshd.service），CLI 不直启
     if [ "${INIT}" = "systemctl" ]; then
-        # 端口/密钥/privsep 目录在每次启动也应用（do_configure 仅部署时执行，老容器靠此兜底）
-        ssh_config_apply >/dev/null 2>&1
         msg "跳过（systemctl 模式：ssh 由 systemctl 管理，端口 ${SSH_PORT} 已写入 sshd_config）"
         return 0
     fi

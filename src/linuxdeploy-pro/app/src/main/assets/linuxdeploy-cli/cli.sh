@@ -382,19 +382,33 @@ is_archive()
     return 1
 }
 
+# 容器目录的"真实路径"（解析符号链接）。/data/data/<包名>/... 这类路径在部分 ROM 上
+# 内核实际记录为 /data/user/0/<包名>/...，而 /proc/<pid>/root 输出的是真实路径；
+# 只用配置里的原样字符串比较会漏判，表现为"容器在跑却显示已停止 / SSH 未运行"。
+container_dir_real()
+{
+    local raw="${CHROOT_DIR%/}"
+    [ -n "${raw}" ] || return 0
+    readlink -f "${raw}" 2>/dev/null || echo "${raw}"
+}
+
 # 获取容器内运行的进程 PID 列表
 # 逐个 readlink /proc/<pid>/root 匹配容器目录：不依赖 ls -l 的输出格式
-# （locale/列宽变化会破坏 grep/sed 解析），也不必一次性物化全部进程的长列表
+# （locale/列宽变化会破坏 grep/sed 解析），也不必一次性物化全部进程的长列表。
+# 匹配同时接受配置原样路径与真实路径（见 container_dir_real 说明）。
 get_pids()
 {
-    local pid_dir pid target
+    local pid_dir pid target real root
     target="${CHROOT_DIR%/}"
     [ -n "${target}" ] || return 0
+    real=$(container_dir_real)
     for pid_dir in /proc/[0-9]*
     do
         [ -e "${pid_dir}/root" ] || continue
         pid="${pid_dir#/proc/}"
-        if [ "$(readlink "${pid_dir}/root" 2>/dev/null)" = "${target}" ]; then
+        root=$(readlink "${pid_dir}/root" 2>/dev/null)
+        [ -n "${root}" ] || continue
+        if [ "${root}" = "${target}" ] || { [ -n "${real}" ] && [ "${root}" = "${real}" ]; }; then
             echo "${pid}"
         fi
     done
@@ -435,14 +449,22 @@ ldstatus_pid()
 #   - 只认 sshd / */sshd / *sshd -D 这类主进程形态，保证状态与真实端口一致。
 sshd_running()
 {
-    local pid_dir pid target a0 a1
+    local pid_dir pid target real a0 a1 root
     target="${CHROOT_DIR%/}"
     [ -n "${target}" ] || return 1
+    real=$(container_dir_real)
     for pid_dir in /proc/[0-9]*
     do
         [ -r "${pid_dir}/cmdline" ] || continue
         pid="${pid_dir#/proc/}"
-        [ "$(readlink "${pid_dir}/root" 2>/dev/null)" = "${target}" ] || continue
+        root=$(readlink "${pid_dir}/root" 2>/dev/null)
+        # 容器目录匹配：原样路径或真实路径任一命中即可（见 container_dir_real）
+        if [ "${root}" != "${target}" ] && { [ -z "${real}" ] || [ "${root}" != "${real}" ]; }; then
+            continue
+        fi
+        # 命中容器目录即说明"容器内有存活进程"。container_status 复用本次遍历
+        # 得到的该标记作为运行判据（见下文），避免为进程存在性再全量扫一遍 /proc。
+        _LD_CONTAINER_STARTED=1
         a0=$(tr '\0' '\n' < "${pid_dir}/cmdline" 2>/dev/null | head -1)
         case "${a0}" in
         sshd|*/sshd) return 0 ;;
@@ -2402,6 +2424,9 @@ container_status()
         local mem_total=0 mem_used=0 swap_total=0 swap_used=0
         local selinux=false loop=false binfmt=false mounted=false running=false
         local installed="未知" supported_fs="" ipv4=""
+        # ssh 独立判定（供前端显示/排障：容器运行但 sshd 未起时能直接看出来）
+        local ssh_enabled=false ssh_running=false
+        case " ${INCLUDE:-} " in *" extra/ssh "*) ssh_enabled=true ;; esac
         if command -v getprop >/dev/null 2>&1; then
             model=$(getprop ro.product.model 2>/dev/null)
             android=$(getprop build.version.release 2>/dev/null)
@@ -2419,10 +2444,16 @@ container_status()
         loop_support && loop=true
         multiarch_support && binfmt=true
         supported_fs=$(printf '%s ' $(grep -v nodev /proc/filesystems | sort))
-        # running 判定：ldstatus 标记进程（跨命名空间）为主，挂载兜底（旧容器无标记）
+        # running / ssh 判定共用一次 /proc 遍历：sshd_running 命中容器目录时会置
+        # _LD_CONTAINER_STARTED，据此即可同时判断"容器内有存活进程"（本判据不依赖
+        # 挂载可见性与 ldstatus 标记，目录/镜像安装、各发行版通用），
+        # 无需为进程存在性再全量扫一遍 /proc（设备进程多时该遍历开销明显）。
+        _LD_CONTAINER_STARTED=""
+        sshd_running && ssh_running=true
         container_mounted >/dev/null 2>&1 && mounted=true
         [ "${mounted}" = "true" ] && running=true
         ldstatus_running && running=true
+        [ -n "${_LD_CONTAINER_STARTED}" ] && running=true
         # App 每次 su -c 都在独立挂载命名空间：当前命名空间通常看不到容器挂载，
         # 直接用 CHROOT_DIR 读 os-release / 遍历进程都会得到错误结果
         # （UI 显示“已停止/SSH 未运行”，但容器实际在跑、SSH 也能连）。
@@ -2439,11 +2470,7 @@ container_status()
             installed=$(grep '^PRETTY_NAME=' "${CHROOT_DIR}/etc/os-release" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
             [ -n "${installed}" ] || installed="未知"
         fi
-        [ -n "${ipv4}" ] || ipv4=$(host_ipv4)
-        # ssh 独立判定（供前端显示/排障：容器运行但 sshd 未起时能直接看出来）
-        local ssh_enabled=false ssh_running=false
-        case " ${INCLUDE:-} " in *" extra/ssh "*) ssh_enabled=true ;; esac
-        sshd_running && ssh_running=true
+        # 局域网 IPv4 以宿主当前实际地址为准（上面的 ldinfo 记录仅作悬挂兜底，可能已过期）
         ipv4=$(host_ipv4)
         printf '{\n'
         printf '  "model": "%s",\n' "$(json_escape "${model}")"
@@ -2523,10 +2550,15 @@ container_status()
     msg "${linux_version}"
 
     msg -n "运行状态: "
-    local running=false mounted=false
+    local running=false mounted=false ssh_running=false
+    # 与 --json 分支一致：一次 /proc 遍历同时得到"容器内有存活进程"与
+    # "容器内 sshd 是否运行"（sshd_running 命中容器目录时置 _LD_CONTAINER_STARTED）
+    _LD_CONTAINER_STARTED=""
+    sshd_running && ssh_running=true
     container_mounted >/dev/null 2>&1 && mounted=true
     [ "${mounted}" = "true" ] && running=true
     ldstatus_running && running=true
+    [ -n "${_LD_CONTAINER_STARTED}" ] && running=true
     # 命名空间不可见时按启动信息还原（见 container_status --json 分支说明）
     if ldinfo_valid; then
         running=true
@@ -2539,7 +2571,8 @@ container_status()
     case " ${INCLUDE:-} " in
     *" extra/ssh "*)
         msg -n "SSH 服务: "
-        sshd_running && msg "运行中（端口 ${SSH_PORT:-22}）" || msg "未运行（本机端口不可连接）"
+        # 复用上方同一次 /proc 遍历的结果（避免重复扫描）
+        [ "${ssh_running}" = "true" ] && msg "运行中（端口 ${SSH_PORT:-22}）" || msg "未运行（本机端口不可连接）"
     ;;
     esac
 
