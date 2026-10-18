@@ -37,8 +37,9 @@ do_install()
         yum_install ${packages}
     ;;
     slackware:*)
-        # Slackware 的 hostname 在 net-tools 包内，没有同名包
-        packages="net-tools"
+        # Slackware 有独立的 hostname 包（集合 a），并非 net-tools 提供；
+        # 15.0/aarch64-current 的 a/ 目录均存在 hostname-<ver>-<arch>-<build>.txz
+        packages="hostname"
         slackpkg_install ${packages}
     ;;
     alpine:*)

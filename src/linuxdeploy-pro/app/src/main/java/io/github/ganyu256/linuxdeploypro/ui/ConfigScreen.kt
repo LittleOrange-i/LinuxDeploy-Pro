@@ -51,14 +51,21 @@ import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
-/** 系统 → 可选发行版本映射（与 CLI 4.0 / debootstrap 对齐） */
+/**
+ * 系统 → 可选发行版本映射（与 CLI bootstrap 组件实际可安装的分支对齐）。
+ *
+ * 注意（2026-10 联网核对）：
+ * - Slackware 的 aarch64 分支只有 slackwareaarch64-current（16.0 未正式发布，
+ *   15.0/14.2 仅提供 x86/x86_64 与 32 位 ARM），因此这里只能提供 current；
+ *   早期提供 15.0 会导致 <源>/slackwareaarch64-15.0 404、部署必失败。
+ */
 private val DISTRO_RELEASES = mapOf(
     "debian" to listOf("trixie", "bookworm", "bullseye"),
     "ubuntu" to listOf("noble", "jammy", "focal"),
     "kali" to listOf("kali-rolling"),
     "alpine" to listOf("edge", "3.22", "3.21", "3.20"),
     "archlinux" to listOf("rolling"),
-    "slackware" to listOf("15.0", "current"),
+    "slackware" to listOf("current"),
     // 本地 rootfs 包：没有发行版本概念
     "rootfs" to emptyList(),
 )
@@ -80,8 +87,9 @@ private val DISTRO_LABELS = mapOf(
  * 新建配置时按所选系统自动填入对应默认源；用户仍可手动修改，
  * 清空后回退发行版官方源（CLI 层处理）。
  * 注意：
- * - 统一用 http；
  * - alpine / archlinux 用清华镜像（USTC 索引文件不可下）；
+ * - slackware 用官方 ARM 镜像（http）：国内主流镜像（USTC/TUNA 等）只同步了 x86 分支，
+ *   没有 slackwarearm 目录；aarch64 分支仅官方 ftp.arm.slackware.com 提供；
  * - ubuntu 用阿里云镜像（2026-10 实测：清华 TUNA 对非浏览器自动化访问返回 403
  *   拦截，debootstrap/wget 高频抓取易触发；阿里云 http/https 均正常开放，
  *   ubuntu-ports/dists/jammy/Release 校验通过：Codename jammy、含 arm64、
@@ -93,7 +101,7 @@ private val DISTRO_MIRRORS = mapOf(
     "kali" to "https://mirrors.ustc.edu.cn/kali/",
     "alpine" to "https://mirrors.tuna.tsinghua.edu.cn/alpine/",
     "archlinux" to "https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/",
-    "slackware" to "https://mirrors.ustc.edu.cn/slackware/",
+    "slackware" to "http://ftp.arm.slackware.com/slackwarearm/",
     "rootfs" to "",
 )
 

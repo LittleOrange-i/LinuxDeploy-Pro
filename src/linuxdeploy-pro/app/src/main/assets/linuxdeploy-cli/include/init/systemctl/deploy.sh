@@ -238,13 +238,23 @@ do_start()
             rm -f "${CHROOT_DIR}/etc/systemd/system/sockets.target.wants/${sock}" 2>/dev/null
             rm -f "${CHROOT_DIR}/etc/systemd/system/${sock}" 2>/dev/null
         fi
-        # unit 被 mask（软链到 /dev/null）时 enable 不生效，先解除
+        # unit 被 mask 时 enable 不生效，先解除。mask 有两种落点：
+        #   1) /etc/systemd/system/xxx -> /dev/null（用户级 mask）
+        #   2) /usr/lib/systemd/system/xxx -> /dev/null（发行版镜像预置，Ubuntu 24.04
+        #      的 ssh.service 曾被镜像以 socket 激活方式 mask）
+        # 早期只清理第 1 种，第 2 种会导致 enable 报 "Unit is masked"，sshd 永不启动。
         local m u2
         for u2 in ${ssh_unit} ${sock}; do
-            m="${CHROOT_DIR}/etc/systemd/system/${u2}"
-            if [ -L "${m}" ]; then
-                rm -f "${m}"
-            fi
+            for m in "${CHROOT_DIR}/etc/systemd/system/${u2}" \
+                     "${CHROOT_DIR}/usr/lib/systemd/system/${u2}" \
+                     "${CHROOT_DIR}/lib/systemd/system/${u2}"; do
+                if [ -L "${m}" ]; then
+                    # 仅解除指向 /dev/null 的 mask 链接，其他软链（正常别名）保留
+                    case "$(readlink "${m}" 2>/dev/null)" in
+                    /dev/null) rm -f "${m}" ;;
+                    esac
+                fi
+            done
         done
         chroot_exec /usr/bin/systemctl enable ${ssh_unit} 2>/dev/null || true
         # 兜底加固：给 ssh unit 写 RestartSec=1s 的 drop-in。

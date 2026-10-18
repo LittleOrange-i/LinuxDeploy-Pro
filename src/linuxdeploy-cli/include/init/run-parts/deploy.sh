@@ -39,28 +39,47 @@ run_parts_services()
     done
 }
 
+# 取实际使用的服务脚本目录：
+# 1) 配置的 INIT_PATH 存在则优先使用；
+# 2) 否则按发行版回退（Arch/Slackware 在 /etc/rc.d，Fedora 系在 /etc/rc.d/init.d）；
+# 3) 都没有则返回空。
+# 早期直接使用配置值，若用户沿用旧版本的其它路径（如 /etc/rc3.d），会静默跳过。
+run_parts_dir()
+{
+    local p
+    for p in "${INIT_PATH}" /etc/rc.d /etc/rc.d/init.d; do
+        [ -n "${p}" ] || continue
+        [ -e "${CHROOT_DIR}${p}" ] && { echo "${p}"; return 0; }
+    done
+    return 1
+}
+
 do_start()
 {
-    [ -n "${INIT_PATH}" ] || return 0
+    [ -n "${INIT_PATH}" ] || [ -n "${DISTRIB}" ] || return 0
 
-    local full="${CHROOT_DIR}${INIT_PATH}"
-    [ -e "${full}" ] || { msg "[跳过] 容器内不存在 ${INIT_PATH}"; return 0; }
+    local dir full
+    dir=$(run_parts_dir) || {
+        msg "[跳过] 容器内不存在服务脚本目录（已尝试 ${INIT_PATH:-未设置}、/etc/rc.d、/etc/rc.d/init.d）"
+        return 0
+    }
+    full="${CHROOT_DIR}${dir}"
 
     if [ -f "${full}" ]; then
         msg ":: 启动 run-parts 脚本: "
-        run_part "${INIT_PATH}" start
+        run_part "${dir}" start
     else
         local services
         services=$(run_parts_services "${full}")
         if [ -n "${services}" ]; then
-            msg ":: 启动 run-parts 服务: "
+            msg ":: 启动 run-parts 服务（${dir}）: "
             local part
             for part in ${services}
             do
-                run_part "${INIT_PATH%/}/${part}" start
+                run_part "${dir%/}/${part}" start
             done
         else
-            msg "[跳过] ${INIT_PATH} 下没有可执行的服务脚本"
+            msg "[跳过] ${dir} 下没有可执行的服务脚本"
         fi
     fi
 
@@ -69,14 +88,15 @@ do_start()
 
 do_stop()
 {
-    [ -n "${INIT_PATH}" ] || return 0
+    [ -n "${INIT_PATH}" ] || [ -n "${DISTRIB}" ] || return 0
 
-    local full="${CHROOT_DIR}${INIT_PATH}"
-    [ -e "${full}" ] || { msg "[跳过] 容器内不存在 ${INIT_PATH}"; return 0; }
+    local dir full
+    dir=$(run_parts_dir) || return 0
+    full="${CHROOT_DIR}${dir}"
 
     if [ -f "${full}" ]; then
         msg ":: 停止 run-parts 脚本: "
-        run_part "${INIT_PATH}" stop
+        run_part "${dir}" stop
     else
         local services
         # 逆序停止不依赖 tac（Android/toybox 与部分精简容器没有该命令），
@@ -87,7 +107,7 @@ do_stop()
             local part
             for part in ${services}
             do
-                run_part "${INIT_PATH%/}/${part}" stop
+                run_part "${dir%/}/${part}" stop
             done
         fi
     fi

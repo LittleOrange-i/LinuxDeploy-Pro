@@ -212,7 +212,18 @@ do_install()
     msg "正在安装软件包: "
     # We must update the certificate before install
 	chroot_exec -u root update-ca-trust
-    pacman_install base $(echo ${core_files} | sed 's/ /\n/g' | awk '{ sub(/-[0-9].*$/,""); print $1 }') ${EXTRA_PACKAGES} ${def_extra_packages}
+    # 只按“索引里的包名”逐个 install，pacman 会顺带解析并补齐依赖；
+    # 这里去重后再传入，避免重复包名导致 pacman 报参数错误。
+    # 注意：包名不能含版本号，否则 pacman 会当作不存在的目标直接失败。
+    local core_pkgs
+    # 注意：不能用 sed 's/ /\n/g' —— busybox sed 不把 \n 识别为换行，
+    # 会把所有包名粘成一个字符串，pacman 直接报 “target not found”。
+    core_pkgs=$(printf '%s\n' ${core_files} | sed 's/-[0-9].*$//' | sort -u | tr '\n' ' ')
+    if [ -z "${core_pkgs}" ]; then
+        msg "失败（未解析到包名）"
+        return 1
+    fi
+    pacman_install base ${core_pkgs} ${EXTRA_PACKAGES} ${def_extra_packages}
     is_ok || return 1
 
     msg -n "正在清理缓存 ... "

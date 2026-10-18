@@ -18,8 +18,13 @@ Linux Deploy CLI 是 LinuxDeploy-Pro 的命令行工具，提供 chroot 容器�
   初始化系统按发行版默认 run-parts、ssh 配置与片段统一、DNS 回退（Android 8+）、
   Alpine 软件源归一化、Kali 源修正、Arch ARM 镜像路径适配、容器启动信息跨命名空间落盘；
   包管理器安装函数（apt/apk/pacman/yum/dnf/slackpkg）下沉到 cli.sh 公共层
-  （修复部署后段组件调用时报 inaccessible or not found）；挂载判定兼容 `/proc/mounts`
-  路径尾斜杠（修复 /dev/pts 误判导致的 apt 报错）
+   （修复部署后段组件调用时报 inaccessible or not found）；挂载判定兼容 `/proc/mounts`
+   路径尾斜杠（修复 /dev/pts 误判导致的 apt 报错）
+- 4.1.20（发行版兼容复查）：Slackware 按 aarch64 真实目录重写（仅 current，FILE_LIST 位于
+  slackware/ 下，doinst.sh 改在容器内执行并补 pwconv/ldconfig）；新增 bootstrap/rootfs
+  支持“本地 rootfs 包”；core/hostname 按发行版改用真实包名；systemctl 解除
+  /usr/lib 下的 unit mask；locale 生成失败降级为告警；Alpine rootfs 回退分支去掉
+  Android 不支持的 `sort -V`
 - 设计文档：[docs/设计说明.md](docs/设计说明.md)
 
 ## 环境要求

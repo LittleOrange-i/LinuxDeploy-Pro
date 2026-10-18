@@ -47,9 +47,27 @@ apk_rootfs_name()
     name=$(wget -q -O - "${branch}/releases/${ARCH}/latest-releases.yaml" 2>/dev/null \
         | grep -m1 "file: alpine-minirootfs" | awk '{print $2}' | tr -d '"' | tr -d "'")
     if [ -z "${name}" ]; then
-        # 回退：抓目录索引，取最新的 alpine-minirootfs-<版本>-<arch>.tar.gz
-        name=$(wget -q -O - "${branch}/releases/${ARCH}/" 2>/dev/null \
-            | grep -o "alpine-minirootfs-[0-9.]*-${ARCH}\.tar\.gz" | sort -V | tail -1)
+        # 回退：抓目录索引，取最新的 alpine-minirootfs-<版本>-<arch>.tar.gz。
+        # 注意：Android toybox 的 sort 不支持 -V（会报 invalid option），
+        # 这里按“主/次/修订版本号数值”比较，保证设备上同样可用。
+        local ver f a b
+        for f in $(wget -q -O - "${branch}/releases/${ARCH}/" 2>/dev/null \
+            | grep -o "alpine-minirootfs-[0-9][0-9.]*-${ARCH}\.tar\.gz" | sort -u)
+        do
+            # 从文件名截出版本号：alpine-minirootfs-3.22.6-aarch64.tar.gz → 3.22.6
+            ver="${f#alpine-minirootfs-}"
+            ver="${ver%-${ARCH}.tar.gz}"
+            case "${ver}" in
+            ''|*[!0-9.]*) continue ;;
+            esac
+            [ -n "${name}" ] || { name="${ver}"; continue; }
+            a=$(printf '%s\n' "${ver}" | awk -F. '{printf "%03d%03d%03d", $1+0, $2+0, $3+0}')
+            b=$(printf '%s\n' "${name}" | awk -F. '{printf "%03d%03d%03d", $1+0, $2+0, $3+0}')
+            if [ "${a}" -gt "${b}" ] 2>/dev/null; then
+                name="${ver}"
+            fi
+        done
+        [ -n "${name}" ] && name="alpine-minirootfs-${name}-${ARCH}.tar.gz"
     fi
     [ -n "${name}" ] || return 1
     echo "${name}"
