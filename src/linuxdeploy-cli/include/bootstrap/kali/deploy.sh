@@ -5,6 +5,10 @@
 # Kali 复用 bootstrap/debian 的 debootstrap 安装流程（EXTENDS=bootstrap/debian），
 # 此处只覆盖发行版差异：
 # 1) 默认代号 kali-rolling、默认源 http.kali.org（arm64 同样走该地址）；
+#    支持的代号：kali-rolling（滚动稳定，默认）/ kali-dev（每日构建）/
+#    kali-last-snapshot（月度快照），三者均为官方仓库池，镜像站（中科大等）同步；
+#    debootstrap scripts/ 目录自带三个代号的安装脚本，apt 源由
+#    bootstrap/debian 的 apt_repository 按 SUITE 写入（不再写死 kali-rolling）；
 # 2) Kali 的 debootstrap 脚本要求系统内存在 kali-archive-keyring，
 #    安卓宿主没有，必须传 --no-check-gpg（debian 流程已默认携带）；
 # 3) Kali 安装包较多，首次 apt 索引较大，需放宽下载重试，避免网络抖动直接失败。
@@ -32,7 +36,8 @@ cat <<EOF
      Architecture of Linux distribution, supported "armel", "armhf", "arm64", "i386" and "amd64".
 
    --suite="${SUITE}"
-     Version of Linux distribution, supported version "kali-rolling".
+     Version of Linux distribution, supported "kali-rolling" (default, rolling),
+     "kali-dev" (daily builds) and "kali-last-snapshot" (monthly snapshots).
 
    --source-path="${SOURCE_PATH}"
      Installation source, can specify address of the repository or path to the rootfs archive.

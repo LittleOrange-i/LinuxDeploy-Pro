@@ -52,18 +52,30 @@ import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
- * 系统 → 可选发行版本映射（与 CLI bootstrap 组件实际可安装的分支对齐）。
+ * 系统 → 可选发行版本（代号）映射（与 CLI bootstrap 组件实际可安装的分支对齐）。
+ * 该字段对应 CLI 的 SUITE 键：前端 release → ConfigStore 写 SUITE → CLI 透传
+ * 至 bootstrap 组件，全链路均为任意代号字符串，各端数据格式保持一致。
  *
  * 注意（2026-10 联网核对）：
+ * - 列表首项为新建配置时的默认值，保持既有行为不变：
+ *   Debian=trixie(13)、Ubuntu=noble(24.04)、Kali=kali-rolling、Alpine=edge；
  * - Slackware 的 aarch64 分支只有 slackwareaarch64-current（16.0 未正式发布，
  *   15.0/14.2 仅提供 x86/x86_64 与 32 位 ARM），因此这里只能提供 current；
- *   早期提供 15.0 会导致 <源>/slackwareaarch64-15.0 404、部署必失败。
+ *   早期提供 15.0 会导致 <源>/slackwareaarch64-15.0 404、部署必失败；
+ * - debian 增加的 forky 为 14（当前 testing），内置 debootstrap 1.0.144 自带
+ *   脚本、镜像源正常同步；ubuntu 增加的 resolute 为 26.04 LTS；已 EOL 的
+ *   临时版（oracular/plucky/questing 等）已从 ports 源移除，不在此列出；
+ * - kali 增加的三个代号均来自官方仓库池：kali-rolling（滚动稳定）、
+ *   kali-dev（每日构建）、kali-last-snapshot（月度快照）；CLI 端
+ *   bootstrap/debian 的 apt_repository 已改为按 SUITE 写源，三者可直接切换；
+ * - alpine 增加的 latest-stable 由 CLI 端 apk_branch() 解析为当前稳定分支；
+ *   任意 v3.x 分支 CLI 均可安装（自动补 v 前缀），此处仅列常用于选择的项。
  */
 private val DISTRO_RELEASES = mapOf(
-    "debian" to listOf("trixie", "bookworm", "bullseye"),
-    "ubuntu" to listOf("noble", "jammy", "focal"),
-    "kali" to listOf("kali-rolling"),
-    "alpine" to listOf("edge", "3.22", "3.21", "3.20"),
+    "debian" to listOf("trixie", "forky", "bookworm", "bullseye"),
+    "ubuntu" to listOf("noble", "resolute", "jammy", "focal"),
+    "kali" to listOf("kali-rolling", "kali-dev", "kali-last-snapshot"),
+    "alpine" to listOf("edge", "latest-stable", "3.22", "3.21", "3.20"),
     "archlinux" to listOf("rolling"),
     "slackware" to listOf("current"),
     // 本地 rootfs 包：没有发行版本概念

@@ -37,7 +37,7 @@ object CliManager {
     private const val EXTRACT_MARKER_FALLBACK = "unknown"
 
     /** CLI 版本（与 cli.sh 内 VERSION 对应，仅用于日志显示） */
-    const val CLI_VERSION = "4.1.20"
+    const val CLI_VERSION = "4.1.21"
 
     /**
      * 进程退出后等待输出读取线程收尾的默认时间（毫秒）。

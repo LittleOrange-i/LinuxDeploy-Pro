@@ -4,7 +4,9 @@
 # 维护：GanYu256（CLI 4.0 重构，中文注释与日志）
 
 # 发行版代号，默认 trixie（Debian 13）
-# 可用值：trixie(13) bookworm(12) bullseye(11) stable testing unstable
+# 可用值：trixie(13) forky(14/testing) bookworm(12) bullseye(11) stable testing unstable
+# 说明：forky 为当前 testing（Debian 14），内置 debootstrap 1.0.144 自带脚本，
+# 官方/镜像源（含中科大）正常同步，可直接作为 SUITE 使用
 [ -n "${SUITE}" ] || SUITE="trixie"
 
 # 架构自动推断；本项目只维护 arm64，其余分支保留兼容
@@ -67,7 +69,8 @@ ensure_container_fs()
 # 签名错误，后续装包（openssh-server 等）全部失败，表现为“能启动但 SSH 连不上”。
 # 这里按发行版分别生成：
 # - Debian：主源 + contrib/non-free/non-free-firmware；
-# - Kali：kali-rolling 的 main/contrib/non-free/non-free-firmware；
+# - Kali：按 SUITE 写 kali-rolling/kali-dev/kali-last-snapshot 的
+#   main/contrib/non-free/non-free-firmware；
 # - Ubuntu：main/universe/multiverse/restricted（由 bootstrap/ubuntu 覆盖，这里兜底）。
 apt_repository()
 {
@@ -88,9 +91,13 @@ apt_repository()
     local src="${SOURCE_PATH%/}"
     case "${DISTRIB}" in
     kali)
-        # Kali 滚动源：kali-rolling 只有 main/contrib/non-free/non-free-firmware
-        echo "deb ${src}/ kali-rolling main contrib non-free non-free-firmware" > "${CHROOT_DIR}/etc/apt/sources.list"
-        echo "deb-src ${src}/ kali-rolling main contrib non-free non-free-firmware" >> "${CHROOT_DIR}/etc/apt/sources.list"
+        # Kali 源按配置的 SUITE 写入（kali-rolling / kali-dev / kali-last-snapshot）。
+        # 早期实现写死 kali-rolling：配置 kali-dev 时 debootstrap 装的是 kali-dev
+        # 的包，apt 源却指向 kali-rolling，两套包库混用会导致升级错乱、部分包
+        # 版本回退。三个代号的组件集相同：main/contrib/non-free/non-free-firmware。
+        local kali_suite="${SUITE:-kali-rolling}"
+        echo "deb ${src}/ ${kali_suite} main contrib non-free non-free-firmware" > "${CHROOT_DIR}/etc/apt/sources.list"
+        echo "deb-src ${src}/ ${kali_suite} main contrib non-free non-free-firmware" >> "${CHROOT_DIR}/etc/apt/sources.list"
     ;;
     ubuntu)
         echo "deb ${src}/ ${SUITE} main universe multiverse restricted" > "${CHROOT_DIR}/etc/apt/sources.list"
@@ -229,7 +236,7 @@ cat <<HELP_EOF
      目标架构，支持 "armel", "armhf", "arm64", "i386" 和 "amd64"（本项目只维护 arm64）。
 
    --suite="${SUITE}"
-     发行版代号，支持 "trixie"(13), "bookworm"(12), "bullseye"(11) 及 stable/testing/unstable。
+     发行版代号，支持 "trixie"(13), "forky"(14/testing), "bookworm"(12), "bullseye"(11) 及 stable/testing/unstable。
 
    --source-path="${SOURCE_PATH}"
      安装源，可指定软件源地址或 rootfs 归档路径。

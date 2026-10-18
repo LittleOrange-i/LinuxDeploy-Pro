@@ -5,7 +5,8 @@ package io.github.ganyu256.linuxdeploypro.model
  *
  * @param name          配置名称（唯一标识）
  * @param distro        系统：debian / ubuntu / kali / alpine / archlinux / slackware / rootfs
- * @param release       发行版本：如 trixie、bookworm（rootfs 本地包时为空）
+ * @param release       发行代号（对应 CLI 的 SUITE，全链路透传字符串）：
+ *                      如 trixie、forky、noble、resolute、kali-dev（rootfs 本地包时为空）
  * @param path          容器根目录（留空表示部署时自动生成）
  * @param installType   安装方式：directory（目录）/ image（ext4 镜像文件）
  * @param imageSize     镜像大小（仅镜像方式使用，如 4G）

@@ -10,7 +10,10 @@
 # rootfs 从未真正安装（部署秒完成、启动必失败），此文件为修复补全。
 
 # 发行版代号，默认 focal（20.04）
-# 可用值：noble(24.04) jammy(22.04) focal(20.04)
+# 可用值：resolute(26.04) noble(24.04) jammy(22.04) focal(20.04)
+# 说明：resolute 为 26.04 LTS，ports 源正常同步；已 EOL 的临时版
+# （oracular/plucky/questing 等）已从 ports.ubuntu.com 移除，装它们需换
+# old-releases 源，故不列入推荐值
 [ -n "${SUITE}" ] || SUITE="focal"
 
 # 架构自动推断；本项目只维护 arm64，其余分支保留兼容
@@ -256,7 +259,7 @@ cat <<HELP_EOF
      目标架构，支持 "armel", "armhf", "arm64", "i386" 和 "amd64"（本项目只维护 arm64）。
 
    --suite="${SUITE}"
-     发行版代号，支持 "noble"(24.04), "jammy"(22.04), "focal"(20.04)。
+     发行版代号，支持 "resolute"(26.04), "noble"(24.04), "jammy"(22.04), "focal"(20.04)。
 
    --source-path="${SOURCE_PATH}"
      安装源，可指定软件源地址或 rootfs 归档路径（arm64 使用 ports.ubuntu.com）。

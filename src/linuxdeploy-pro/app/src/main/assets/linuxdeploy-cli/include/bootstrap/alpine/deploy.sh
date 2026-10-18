@@ -172,7 +172,8 @@ cat <<EOF
      Architecture of Linux distribution, supported "aarch64", "armhf", "x86" and "x86_64".
 
    --suite="${SUITE}"
-     Version of Linux distribution, supported version "latest-stable", "3.22", "edge".
+     Version of Linux distribution, supported "latest-stable", "edge" and any
+     "v3.x" release branch (e.g. "3.22"; the "v" prefix is added automatically).
 
    --source-path="${SOURCE_PATH}"
      Installation source, can specify address of the repository or path to the rootfs archive.
