@@ -280,6 +280,48 @@ ssh_session_harden()
         fi
     done
 
+    # ---- pam_unix 的 nullok_secure（keyboard-interactive 登录必失败的真凶）----
+    # 现象：Windows/Linux 的 ssh 客户端默认优先协商 keyboard-interactive，
+    # 认证阶段能通过（auth.log: Accepted keyboard-interactive/pam），紧接着
+    #   fatal: PAM: pam_setcred(): Failure setting user credentials
+    # 连接被断开；而 paramiko 等强制走 password 认证的客户端却正常。
+    # 原因：Ubuntu/Debian 的 /etc/pam.d/common-auth 里写的是
+    #   auth [success=1 default=ignore] pam_unix.so nullok_secure
+    # nullok_secure 要求“空密码只允许在安全 tty 上”，模块会去读 /etc/securetty
+    # 并校验 tty 名；容器里既没有 /etc/securetty，tty 又是 "ssh"，
+    # 该路径在 kbdint 认证后留下坏的凭据上下文，setcred 直接返回 PAM_CRED_ERR。
+    # 修复：去掉 nullok_secure（容器内 root 密码由 core/profile 设置，不需要
+    # 空密码例外），并补一个最小的 /etc/securetty，双保险覆盖不同 PAM 版本。
+    local ca_f
+    for ca_f in "${CHROOT_DIR}/etc/pam.d/common-auth"
+    do
+        [ -f "${ca_f}" ] || continue
+        if grep -Eq 'nullok_secure' "${ca_f}" 2>/dev/null; then
+            # BRE：删掉 nullok_secure 及其前面的空白（保留 pam_unix.so 的其它参数）。
+            # 注意不能假设固定几个空格：Debian/Ubuntu 模板通常写两个空格，
+            # 但不同版本/用户改过的配置可能只有一个，用 [:+space:]* 更稳。
+            sed -i 's/[[:space:]][[:space:]]*nullok_secure//' "${ca_f}"
+            sed -i 's/nullok_secure[[:space:]]*//' "${ca_f}"
+            msg ":: 已移除 ${ca_f#"${CHROOT_DIR}"} 的 nullok_secure（否则 keyboard-interactive 登录后 pam_setcred 失败）"
+        fi
+    done
+    # /etc/securetty：pam_unix 在 nullok_secure / securetty 校验时读取；
+    # 缺失会让 pam_unix 持续打印 "Couldn't open /etc/securetty"。
+    if [ ! -e "${CHROOT_DIR}/etc/securetty" ]; then
+        {
+            echo "# linuxdeploy: 容器内允许 root 登录的 tty（pam_unix securetty 校验用）"
+            echo "console"
+            echo "tty1"
+            echo "tty2"
+            echo "pts/0"
+            echo "pts/1"
+            echo "pts/2"
+            echo "pts/3"
+            echo "ssh"
+        } > "${CHROOT_DIR}/etc/securetty" 2>/dev/null || true
+        chmod 644 "${CHROOT_DIR}/etc/securetty" 2>/dev/null || true
+    fi
+
     # privsep 目录权限：sshd 对 /run/sshd 与 /var/empty 的所有者/权限有硬性要求
     # （必须 root，且不可被组/其他用户写），否则 9.x 起直接在会话阶段拒绝。
     for d in /run/sshd /var/run/sshd /var/empty
