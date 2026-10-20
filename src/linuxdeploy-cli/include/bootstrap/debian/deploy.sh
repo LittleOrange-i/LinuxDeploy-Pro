@@ -123,6 +123,12 @@ do_install()
     local DEBOOTSTRAP_DIR rc_file debootstrap_rc
     DEBOOTSTRAP_DIR="$(component_dir bootstrap/debian)/debootstrap"
     mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    # 必须“先声明再单独赋值”：写成 rc_file=$(mktemp ...) 时，命令替换结果会被
+    # 字段分割后交给 local/typeset 当变量名解析，mksh（Android 的 sh）会报
+    # “typeset: ...: is not an identifier” 并让 rc_file 为空，随后
+    # echo $? > "" 失败 → set -e 直接中断——表现为“第一次部署在 debootstrap
+    # 一阶段结束后莫名失败，再部署一次又好了”的间歇性故障。
+    rc_file=""
     rc_file=$(mktemp "${TEMP_DIR}/ld-debootstrap.XXXXXX") || return 1
 
     # 一阶段：仅解包基础系统到目标目录
@@ -176,6 +182,7 @@ do_install()
 
     # 二阶段：在 chroot 内完成包配置
     unset DEBOOTSTRAP_DIR
+    rc_file=""
     rc_file=$(mktemp "${TEMP_DIR}/ld-second.XXXXXX") || return 1
     (
         chroot_exec /debootstrap/debootstrap --no-check-gpg --second-stage 2>&1

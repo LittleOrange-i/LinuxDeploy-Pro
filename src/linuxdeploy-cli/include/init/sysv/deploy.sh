@@ -43,7 +43,8 @@ do_start()
         msg "        本发行版的服务脚本通常在 /etc/rc.d，请在配置中将「初始化系统」改为 run-parts。"
         return 0
     fi
-    local services=$(ls "${rcdir}" 2>/dev/null | grep '^S')
+    local services
+    services=$(ls "${rcdir}" 2>/dev/null | grep '^S')
     if [ -n "${services}" ]; then
         msg ":: 启动 SysV 服务（${rcdir##*/}）: "
         local item
@@ -73,7 +74,8 @@ do_stop()
         msg "[跳过] 容器内不存在 SysV 停止目录（/etc/rc6.d 或 /etc/rc0.d）"
         return 0
     fi
-    local services=$(ls "${rcdir}" 2>/dev/null | grep '^K')
+    local services
+    services=$(ls "${rcdir}" 2>/dev/null | grep '^K')
     if [ -n "${services}" ]; then
         msg ":: 停止 SysV 服务（${rcdir##*/}）: "
         local item

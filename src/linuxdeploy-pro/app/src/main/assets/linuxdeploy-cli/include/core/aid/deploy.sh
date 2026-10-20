@@ -33,8 +33,11 @@ do_configure()
     local aid
     for aid in $(cat "${COMPONENT_DIR}/android_groups")
     do
-        local xname=$(echo ${aid} | awk -F: '{print $1}')
-        local xid=$(echo ${aid} | awk -F: '{print $2}')
+        # 先声明再单独赋值（mksh 下 local x=$(...) 会把结果当变量名解析，
+        # 循环里一旦失败会让 core/aid 中止、部署随机失败）
+        local xname xid
+        xname=$(echo ${aid} | awk -F: '{print $1}')
+        xid=$(echo ${aid} | awk -F: '{print $2}')
         sed -i "s|^${xname}:.*|${xname}:x:${xid}:|" "${CHROOT_DIR}/etc/group"
         if ! grep -q "^${xname}:" "${CHROOT_DIR}/etc/group"; then
             echo "${xname}:x:${xid}:" >> "${CHROOT_DIR}/etc/group"

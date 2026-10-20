@@ -9,8 +9,10 @@ do_configure()
 {
     msg ":: 正在配置 ${COMPONENT} ... "
     if $(echo ${LOCALE} | grep -q '\.'); then
-        local inputfile=$(echo ${LOCALE} | awk -F. '{print $1}')
-        local charmapfile=$(echo ${LOCALE} | awk -F. '{print $2}')
+        # 先声明再单独赋值（mksh 下 local x=$(...) 会把结果当变量名解析）
+        local inputfile charmapfile
+        inputfile=$(echo ${LOCALE} | awk -F. '{print $1}')
+        charmapfile=$(echo ${LOCALE} | awk -F. '{print $2}')
         # localedef 失败不应让整个部署中止：
         # 容器内缺少 /usr/share/i18n 数据（精简发行版，如 Slackware 的 glibc 不含
         # locale 源文件）时会直接返回非 0，而组件在 set -e 下会中断部署。

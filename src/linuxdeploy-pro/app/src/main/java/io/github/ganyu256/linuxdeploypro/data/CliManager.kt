@@ -532,10 +532,17 @@ object CliManager {
      */
     /**
      * 检查部署目标目录是否非空。
+     * @param knownEmpty 已知目录为空（同一次运行里刚刚成功部署过）时跳过 CLI 检查，
+     *   避免出现“配置已就绪 → 检查 → 检查失败 → 被强制部署确认拦住”的关卡叠加。
      * @return 第一项：true=目录非空；false=目录为空；null=检查失败或配置不存在
      * @return 第二项：失败时的 CLI 原始输出（诊断，供日志展示）
      */
-    fun isTargetDirNonEmpty(context: Context, name: String): Pair<Boolean?, String> {
+    fun isTargetDirNonEmpty(
+        context: Context,
+        name: String,
+        knownEmpty: Boolean = false,
+    ): Pair<Boolean?, String> {
+        if (knownEmpty) return Pair(false, "")
         return try {
             val result = runCli(context, listOf("-c", name, "--json", "check"))
             // 优先解析 JSON（与退出码无关），仅用"容器目录非空"判断是否需强制部署确认；

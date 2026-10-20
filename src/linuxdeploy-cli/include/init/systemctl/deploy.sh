@@ -15,14 +15,33 @@
 # 规避：脚本内调用此类工具时显式重定向 stdio 并脱离进程树，例如：
 #   setsid /sbin/unchroot am start <pkg>/<Activity> </dev/null >/dev/null 2>&1 &
 
-# systemctl 常驻进程检查：读容器内 pid 文件 + /proc/<pid>/cmdline 校验进程名
+# systemctl 常驻进程检查：读容器内 pid 文件 + /proc/<pid>/cmdline 校验进程名。
+# 注意：容器每次停止都会清空进程，pid 会被系统复用——旧 pid 文件若残留，
+# 复用该 pid 的任意进程都可能让“看起来已在运行”，于是第二次启动直接跳过、
+# init 从未被拉起（表现为首次部署失败、重启一次才正常的间歇性问题）。
+# 这里额外要求该 pid 的 /proc/<pid>/root 就是本容器目录。
+systemctl_pid_alive()
+{
+    local s_pid
+    s_pid="$1"
+    local root real
+    [ -n "${s_pid}" ] || return 1
+    [ -r "/proc/${s_pid}/cmdline" ] || return 1
+    root=$(readlink "/proc/${s_pid}/root" 2>/dev/null)
+    real=$(container_dir_real)
+    # 容器目录匹配：原样路径或真实路径任一命中即可（与 cli.sh 的 sshd_running 一致）
+    if [ -n "${root}" ] && [ "${root}" != "${CHROOT_DIR%/}" ] && [ "${root}" != "${real}" ]; then
+        return 1
+    fi
+    tr '\0' ' ' < "/proc/${s_pid}/cmdline" | grep -q systemctl
+}
+
 systemctl_running()
 {
     local s_pid
     s_pid=$(cat "${CHROOT_DIR}/run/systemctl/pid" 2>/dev/null | tr -cd '0-9')
     [ -n "${s_pid}" ] || return 1
-    [ -r "/proc/${s_pid}/cmdline" ] || return 1
-    tr '\0' ' ' < "/proc/${s_pid}/cmdline" | grep -q systemctl
+    systemctl_pid_alive "${s_pid}"
 }
 
 # 容器内 python3 是否可用（systemctl.py 的运行依赖）
@@ -214,6 +233,12 @@ do_start()
     # 修复：同上，pid 目录必须落在容器内，init 才能成功写 /run/systemctl/pid
     # （systemctl_running()/do_stop 都依赖该文件，缺失会导致重复拉起 init）
     make_dirs "${CHROOT_DIR}/run/systemctl"
+    # 清掉上一轮的 pid 文件：容器停止后进程已不存在，残留 pid 一旦被复用，
+    # 下面的“等待 init 起来”会误判成功（首次部署/首次启动表现为“启动失败或
+    # 服务不全，重启一次就正常”）。
+    if ! systemctl_running; then
+        rm -f "${CHROOT_DIR}/run/systemctl/pid" 2>/dev/null || true
+    fi
     # docker / containerd 在无 systemd 的 chroot 内的启动适配（未安装时不做任何事）
     container_runtime_tune
     # 内核缺少 devices/pids 等控制器时提示 Docker 不可用（不影响其它服务）
@@ -297,6 +322,11 @@ RESTARTSEC
         msg "        可打开终端执行 /usr/bin/systemctl --init 查看报错，或重新部署。"
         return 1
     fi
+    # pid 文件属主对齐：容器内 init 由 root 写入，之后 CLI 以 root 读取没问题，
+    # 但部分 ROM 的 run/ 目录会带宿主 app 的 uid，导致下一轮 do_stop 读不到 pid
+    # 而无法干净停机（残留进程会把挂载攥住）。这里统一 root:root 0755。
+    chown 0:0 "${CHROOT_DIR}/run/systemctl" "${CHROOT_DIR}/run/systemctl/pid" 2>/dev/null || true
+    chmod 755 "${CHROOT_DIR}/run/systemctl" 2>/dev/null || true
     is_ok "失败" "完成"
     return 0
 }

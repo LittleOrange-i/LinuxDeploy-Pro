@@ -6,8 +6,11 @@ get_qemu()
 {
     local arch="$1"
     local qemu=""
-    local host_platform=$(get_platform)
-    local guest_platform=$(get_platform "${arch}")
+    # 先声明再单独赋值：mksh 下 local x=$(...) 会把命令替换结果当变量名解析，
+    # 报 “typeset: ...: is not an identifier” 并让变量为空（部署随机失败）。
+    local host_platform guest_platform
+    host_platform=$(get_platform)
+    guest_platform=$(get_platform "${arch}")
     if [ "${host_platform}" != "${guest_platform}" ]; then
         case "${guest_platform}" in
         arm) qemu="qemu-arm-static" ;;
@@ -35,8 +38,9 @@ do_start()
     multiarch_support || return 0
 
     msg -n ":: Starting ${COMPONENT} ... "
-    local source_path=$(which ${EMULATOR})
-    local target_path="/usr/bin/${EMULATOR}"
+    local source_path target_path
+    source_path=$(which ${EMULATOR})
+    target_path="/usr/bin/${EMULATOR}"
     if [ ! -e "${CHROOT_DIR}${target_path%/*}" ]; then
         mkdir -p "${CHROOT_DIR}${target_path%/*}"
     fi

@@ -820,6 +820,26 @@ ld_capture_cleanup()
     return 0
 }
 
+# 最近一次失败的组件名（组件执行子 shell 写、部署收尾读）。
+# 组件在 set -e 下中途退出时，exit 1 发生在子 shell 内，部署主流程只能看到
+# “组件执行返回 1”，看不出是哪个组件、哪一步——首次部署失败时几乎无法定位。
+LD_FAIL_STATE="${TEMP_DIR}/ld-fail-component"
+
+ld_fail_reset()
+{
+    mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    : > "${LD_FAIL_STATE}" 2>/dev/null || true
+    return 0
+}
+
+# 记录/读取出错组件（$1=组件名，$2=动作；不带参数时输出记录内容）
+ld_fail_mark()
+{
+    [ -n "${LD_FAIL_STATE}" ] || return 0
+    printf '%s\n' "$1 ($2)" > "${LD_FAIL_STATE}" 2>/dev/null || true
+    return 0
+}
+
 # 把日志文件里最近的错误行输出到 stdout（$1=条数，默认 5）
 ld_log_tail_errors()
 {
@@ -1119,7 +1139,10 @@ config_file_of()
 config_exists()
 {
     conf_file
-    local conf_file=$(config_file_of "$1")
+    # 先声明再单独赋值：mksh 下 local x=$(...) 会把命令替换结果当变量名解析，
+    # 报 “typeset: ...: is not an identifier” 并让变量为空（配置被误判不存在）。
+    local conf_file
+    conf_file=$(config_file_of "$1")
     [ -e "${conf_file}" ]
 }
 
@@ -1193,7 +1216,9 @@ config_show()
         return 1
     fi
     conf_file
-    local conf_file=$(config_file_of "${name}")
+    # 先声明再单独赋值（mksh：local x=$(...) 会报 typeset 错误并置空）
+    local conf_file
+    conf_file=$(config_file_of "${name}")
     [ -e "${conf_file}" ] || { msg "配置不存在: ${name}"; return 1; }
     # --json 模式：输出配置键值对（前端解析用）
     if [ "${JSON_MODE}" = "true" ]; then
@@ -1305,7 +1330,9 @@ config_edit()
     local name="${CURRENT_CONF}"
     [ -n "${name}" ] || { msg "请用 -c <配置名> 指定要编辑的配置"; return 1; }
     conf_file
-    local conf_file=$(config_file_of "${name}")
+    # 先声明再单独赋值（mksh：local x=$(...) 会报 typeset 错误并置空）
+    local conf_file
+    conf_file=$(config_file_of "${name}")
     [ -e "${conf_file}" ] || { msg "配置文件缺失: ${conf_file}"; return 1; }
 
     # 保存编辑前的配置备份
@@ -1330,8 +1357,10 @@ config_copy()
     config_exists "${src}" || { msg "源配置不存在: ${src}"; return 1; }
     config_exists "${dst}" && { msg "目标配置已存在: ${dst}"; return 1; }
     src_file dst_file
-    local src_file=$(config_file_of "${src}")
-    local dst_file=$(config_file_of "${dst}")
+    # 先声明再单独赋值（mksh：local x=$(...) 会报 typeset 错误并置空）
+    local src_file dst_file
+    src_file=$(config_file_of "${src}")
+    dst_file=$(config_file_of "${dst}")
     cp "${src_file}" "${dst_file}"
     msg "已复制配置: ${src} -> ${dst}"
 }
@@ -1352,8 +1381,10 @@ config_delete()
     # 读取该配置的容器目录（参数化解析，不用 eval：
     # 配置文件若被植入 CHROOT_DIR=x; rm -rf / 之类内容会直接执行）
     conf_file chroot_dir
-    local conf_file=$(config_file_of "${name}")
-    local chroot_dir=""
+    # 先声明再单独赋值（mksh：local x=$(...) 会报 typeset 错误并置空）
+    local conf_file chroot_dir
+    conf_file=$(config_file_of "${name}")
+    chroot_dir=""
     if [ -e "${conf_file}" ]; then
         chroot_dir=$(grep '^CHROOT_DIR=' "${conf_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
     fi
@@ -1382,7 +1413,8 @@ config_export()
     [ -n "${out_file}" ] || { msg "用法: config export <导出文件>"; return 1; }
     local name="${CURRENT_CONF}"
     [ -n "${name}" ] || { msg "请用 -c <配置名> 指定要导出的配置"; return 1; }
-    local conf_file=$(config_file_of "${name}")
+    local conf_file
+    conf_file=$(config_file_of "${name}")
     [ -e "${conf_file}" ] || { msg "配置文件缺失: ${conf_file}"; return 1; }
     cp "${conf_file}" "${out_file}"
     msg "已导出配置 ${name} 到: ${out_file}"
@@ -1411,14 +1443,16 @@ config_import()
         dst=$(basename "${src_file}" .conf)
     fi
     dst_file
-    local dst_file=$(config_file_of "${dst}")
+    # 先声明再单独赋值（mksh：local x=$(...) 会报 typeset 错误并置空）
+    local dst_file
+    dst_file=$(config_file_of "${dst}")
     [ -e "${dst_file}" ] && { msg "目标配置已存在: ${dst}"; return 1; }
 
     # 复制并确保容器目录隔离
     cp "${src_file}" "${dst_file}"
     # 若导入的配置未指定 CHROOT_DIR 或与已有配置冲突，重新分配独立目录
     local imported_dir
-    local imported_dir=$(grep '^CHROOT_DIR=' "${dst_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
+    imported_dir=$(grep '^CHROOT_DIR=' "${dst_file}" | head -1 | sed -e 's/^[^=]*=//' -e 's/^"//' -e 's/"$//')
     if [ -z "${imported_dir}" ]; then
         sed -i "s|^CHROOT_DIR=.*|CHROOT_DIR=\"$(config_default_chroot_dir "${dst}")\"|" "${dst_file}"
         imported_dir=$(config_default_chroot_dir "${dst}")
@@ -1553,6 +1587,19 @@ component_depends()
             esac
         ;;
         esac
+        # 依赖了参数化父组件（如 extra/ssh 声明 DEPENDS="core init"）时，
+        # 父目录本身没有 deploy.conf，会被当成“组件不存在”直接跳过——
+        # 于是初始化系统（init/sysv、init/systemctl 等）永远不进执行计划，
+        # sshd 在“sysv/run-parts 需要 rc 脚本拉起”的发行版上随容器启动
+        # 从不被拉起（表现为容器运行中、22 端口无人监听）。这里把父目录
+        # 降级为当前参数对应的子组件（init → init/${INIT}）。
+        case "${DEPENDS}" in
+        *init*)
+            if [ ! -e "${INCLUDE_DIR}/init/deploy.conf" ]; then
+                DEPENDS=$(echo " ${DEPENDS} " | sed "s# init # init/${INIT:-sysv} #g" | sed -e 's/^ //' -e 's/ $//')
+            fi
+        ;;
+        esac
         case "${TARGET}" in
         *'${'*) TARGET=$(component_expand_name ${TARGET}) ;;
         esac
@@ -1630,8 +1677,12 @@ component_exec()
             ;;
             esac
             set +e
-            eval ${DO_ACTION} || exit 1
+            # 记录当前组件：失败时由外层 deploy 收尾打印“哪个组件、哪一步”出错，
+            # 否则首次部署失败只会留下“部署未完成（退出码 1）”，无从定位。
+            eval ${DO_ACTION}
+            _ld_component_rc=$?
             set -e
+            [ "${_ld_component_rc}" -eq 0 ] || { ld_fail_mark "${COMPONENT}" "${DO_ACTION}"; exit 1; }
         done
     exit 0)
     is_ok || return 1
@@ -1651,7 +1702,8 @@ component_list()
                 echo "${component}"
             done)
     fi
-    local components=$(IGNORE_DEPENDS=" " component_depends ${components} | sort)
+    local components
+    components=$(IGNORE_DEPENDS=" " component_depends ${components} | sort)
     for component in $components
     do
         DESC=''
@@ -1724,7 +1776,8 @@ fs_check()
     if is_mounted "${CHROOT_DIR}"; then
         return 1
     fi
-    local checkfs=$(which e2fsck)
+    local checkfs
+    checkfs=$(which e2fsck)
     if [ -z "${checkfs}" ]; then
         return 1
     fi
@@ -2046,6 +2099,18 @@ container_mount()
         mount_part ${item} || return 1
     done
 
+    # sshd privsep 目录：容器内的 /run 通常是 tmpfs（容器停止即清空），
+    # 而 sshd 启动时若发现 `/run/sshd` 不存在会直接退出
+    # （Missing privilege separation directory: /run/sshd），
+    # systemctl/init 拉起 sshd 的路径不经过 extra/ssh 的 do_start，因此这里
+    # 在每次挂载容器后统一补齐（目录很小，存在时无副作用）。
+    # 属主必须 root、权限 755：OpenSSH 9.x 对 privsep 目录有强校验。
+    if [ -d "${CHROOT_DIR}/usr" ] || [ -d "${CHROOT_DIR}/etc" ]; then
+        mkdir -p "${CHROOT_DIR}/run/sshd" 2>/dev/null || true
+        chown 0:0 "${CHROOT_DIR}/run/sshd" 2>/dev/null || true
+        chmod 755 "${CHROOT_DIR}/run/sshd" 2>/dev/null || true
+    fi
+
     return 0
 }
 
@@ -2073,12 +2138,13 @@ container_umount()
     # 剩余子挂载会变成 "Invalid argument" 无法卸载，残留的 /proc /dev 让
     # 状态判定一直为"运行中"（表现为停止后 UI 仍显示运行中）。
     # 同一挂载点在 /proc/mounts 里可能重复出现，去重后再处理。
-    local parts=$(awk -v base="${CHROOT_DIR%/}" '$2==base || index($2, base"/")==1 {print $2}' /proc/mounts \
+    local parts
+    parts=$(awk -v base="${CHROOT_DIR%/}" '$2==base || index($2, base"/")==1 {print $2}' /proc/mounts \
         | awk '!seen[$0]++ { n=split($0, a, "/"); print n"\t"$0 }' | sort -rn | cut -f2)
-    local part
+    local part part_name
     for part in ${parts}
     do
-        local part_name=$(echo ${part} | sed "s|^${CHROOT_DIR%/}/*|/|g")
+        part_name=$(echo ${part} | sed "s|^${CHROOT_DIR%/}/*|/|g")
         [ -n "${part_name}" ] || part_name="/"
         msg -n "${part_name} ... "
         local i
@@ -2509,13 +2575,15 @@ container_status()
         printf '}\n'
         return 0
     fi
-    local model=$(which getprop >/dev/null 2>&1 && getprop ro.product.model)
+    local model
+    model=$(which getprop >/dev/null 2>&1 && getprop ro.product.model)
     if [ -n "${model}" ]; then
         msg -n "设备型号: "
         msg "${model}"
     fi
 
-    local android=$(which getprop >/dev/null 2>&1 && getprop ro.build.version.release)
+    local android
+    android=$(which getprop >/dev/null 2>&1 && getprop ro.build.version.release)
     if [ -n "${android}" ]; then
         msg -n "Android 版本: "
         msg "${android}"
@@ -2528,16 +2596,18 @@ container_status()
     msg "$(uname -r)"
 
     msg -n "内存: "
-    local mem_total=$(grep ^MemTotal /proc/meminfo | awk '{print $2}')
+    local mem_total mem_free
+    mem_total=$(grep ^MemTotal /proc/meminfo | awk '{print $2}')
     mem_total=$((mem_total/1024))
-    local mem_free=$(grep ^MemFree /proc/meminfo | awk '{print $2}')
+    mem_free=$(grep ^MemFree /proc/meminfo | awk '{print $2}')
     mem_free=$((mem_free/1024))
     msg "${mem_free}/${mem_total} MB"
 
     msg -n "Swap: "
-    local swap_total=$(grep ^SwapTotal /proc/meminfo | awk '{print $2}')
+    local swap_total swap_free
+    swap_total=$(grep ^SwapTotal /proc/meminfo | awk '{print $2}')
     swap_total=$((swap_total/1024))
-    local swap_free=$(grep ^SwapFree /proc/meminfo | awk '{print $2}')
+    swap_free=$(grep ^SwapFree /proc/meminfo | awk '{print $2}')
     swap_free=$((swap_free/1024))
     msg "${swap_free}/${swap_total} MB"
 
@@ -2551,7 +2621,8 @@ container_status()
     multiarch_support && msg "支持" || msg "不支持"
 
     msg -n "支持的挂载文件系统: "
-    local supported_fs=$(printf '%s ' $(grep -v nodev /proc/filesystems | sort))
+    local supported_fs
+    supported_fs=$(printf '%s ' $(grep -v nodev /proc/filesystems | sort))
     msg "${supported_fs}"
 
     msg -n "已安装系统: "
@@ -2579,7 +2650,8 @@ container_status()
     fi
     [ "${running}" = "true" ] && msg "运行中" || msg "已停止"
     msg -n "局域网 IPv4: "
-    local lan_ip=$(host_ipv4)
+    local lan_ip
+    lan_ip=$(host_ipv4)
     [ -n "${lan_ip}" ] || lan_ip=$(ldinfo_get IPV4)
     [ -n "${lan_ip}" ] && msg "${lan_ip}" || msg "未连接网络"
     case " ${INCLUDE:-} " in
@@ -3217,6 +3289,8 @@ deploy)
     log_open "${CURRENT_CONF:-deploy}"
     # 组件内部命令的 stderr 副本写入日志（失败收尾时回显，T13 修复失败不可见问题）
     ld_capture_errors
+    # 清空上一轮的“出错组件”记录，避免历史失败记录误报到本次部署
+    ld_fail_reset
     dry_run="false"
     yes_mode="false"
     mount_flag="false"
@@ -3299,7 +3373,20 @@ deploy)
         fi
         # 清空目录内容（保留目录本身）：清除半截 debootstrap 缓存/残留，
         # 避免脏目录复用损坏缓存导致"光速报错"（强制部署 = 清空后全新部署）
+        #
+        # 清空前必须先结束上一轮容器进程并卸载挂载：
+        # 1) 容器若仍在运行（上一次部署/启动遗留、或停止流程异常），rootfs 里
+        #    的 debootstrap / apt / dpkg 进程会在目录被清空后继续写文件，
+        #    表现为“第一次部署莫名失败，再点一次强制部署就好了”；
+        # 2) 目录仍被 bind/loop 挂载时 find -delete 会触发 “Device or resource busy”，
+        #    半清空后再安装必然产生残缺 rootfs；
+        # 3) 镜像安装的 loop 设备不释放，重建镜像会直接失败。
+        # container_stop 内部会在容器运行中时切入其命名空间执行并自动卸载挂载。
         if [ -n "${CHROOT_DIR}" ] && [ "${CHROOT_DIR}" != "/" ]; then
+            if container_mounted >/dev/null 2>&1 || [ -n "$(get_pids)" ]; then
+                msg "检测到上一轮容器进程/挂载残留，正在停止并卸载后再清空 ..."
+                container_stop >/dev/null 2>&1 || msg "[提示] 停止旧容器时有告警，继续执行清理"
+            fi
             msg "正在清空目标目录: ${CHROOT_DIR}"
             find "${CHROOT_DIR}" -mindepth 1 -delete 2>/dev/null || {
                 rm -rf "${CHROOT_DIR:?}/"* "${CHROOT_DIR:?}/".[!.]* 2>/dev/null || true
@@ -3331,15 +3418,28 @@ deploy)
                 msg "部署失败，正在卸载残留挂载 ..."
                 container_umount >/dev/null 2>&1 || true
             fi
+            # 失败定位：先点名出错的组件（component_exec 子 shell 写入），
+            # 没有记录时说明失败发生在组件之外（网络/清空目录/前置校验等）。
+            local _ld_fail_comp=""
+            [ -s "${LD_FAIL_STATE}" ] && _ld_fail_comp=$(cat "${LD_FAIL_STATE}" 2>/dev/null)
+            if [ -n "${_ld_fail_comp}" ]; then
+                msg "部署失败位置: 组件 ${_ld_fail_comp}"
+            else
+                msg "部署失败位置: 组件执行之前（安装源/网络/磁盘或前置校验）"
+            fi
             # 失败原因回显：组件内命令的报错原本只走 stderr（UI 看不到），
             # 这里把捕获到的 stderr 写入日志并回显到输出末尾，UI 日志页可直接定位。
-            _ld_errs=$(ld_collect_errors 6)
+            _ld_errs=$(ld_collect_errors 10)
             if [ -n "${_ld_errs}" ]; then
                 msg "部署失败，最近的错误信息："
                 printf '%s\n' "${_ld_errs}"
             fi
             ld_capture_cleanup
+            # 明确给出重试口径：之前的部署失败后目录里必然留下半截 rootfs，
+            # 用户再点一次会被“目标目录非空 → 强制部署”拦下，误以为必须“强制”才行。
             msg "部署未完成（退出码 ${rc}），完整日志: ${LOG_FILE}"
+            msg "        下一步：可直接再次执行部署（工具会自动清空半截 rootfs 后重装）。"
+            msg "        若重复失败，请按上面的“部署失败位置/最近错误”排查，或反馈完整日志。"
         elif [ "${keep_mounted}" != "true" ] && container_mounted >/dev/null 2>&1; then
             msg "部署完成，正在卸载容器挂载（可用 start 启动）..."
             ld_capture_cleanup

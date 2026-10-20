@@ -24,11 +24,14 @@ do_install()
     local image="${SOURCE_PATH%%:*}"
     local tag="${SOURCE_PATH##*:}"
     msg -n "正在验证 Docker 软件源 ... "
-    local token=$(wget -q -O - "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${image}:pull" | grep -oE '"token":"[.a-zA-Z0-9_-]+"' | tr -d '"' | awk -F':' '{print $2}')
+    # 先声明再单独赋值（mksh：local x=$(...) 会报 typeset 错误并置空）
+    local token
+    token=$(wget -q -O - "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${image}:pull" | grep -oE '"token":"[.a-zA-Z0-9_-]+"' | tr -d '"' | awk -F':' '{print $2}')
     test -n "${token}"
     is_ok "失败" "完成" || return 1
     msg -n "正在获取仓库清单 ... "
-    local manifest=$(wget -q -O - --header "Authorization: Bearer ${token}" --header "Accept: application/vnd.docker.distribution.manifest.list.v2+json" "https://registry-1.docker.io/v2/${image}/manifests/${tag}" | sed 's/},{/\n/g' | grep "\"${ARCH}\".*\"${SUITE}\"" | grep -oE 'sha256:[a-f0-9]{64}')
+    local manifest
+    manifest=$(wget -q -O - --header "Authorization: Bearer ${token}" --header "Accept: application/vnd.docker.distribution.manifest.list.v2+json" "https://registry-1.docker.io/v2/${image}/manifests/${tag}" | sed 's/},{/\n/g' | grep "\"${ARCH}\".*\"${SUITE}\"" | grep -oE 'sha256:[a-f0-9]{64}')
     test -n "${manifest}"
     is_ok "失败" "完成" || return 1
     msg "正在获取 rootfs 数据块: "

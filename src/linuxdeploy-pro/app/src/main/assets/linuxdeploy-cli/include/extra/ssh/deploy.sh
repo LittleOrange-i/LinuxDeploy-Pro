@@ -42,6 +42,86 @@ ssh_keys_ready()
     ls "${CHROOT_DIR}/etc/ssh/" 2>/dev/null | grep -q 'key$'
 }
 
+# 容器内 sshd 的主版本号（如 8 / 9 / 10），取不到时输出空串。
+# 用途：OpenSSH 9.8 起才把会话处理拆成独立的 sshd-session（放在
+# /usr/lib/openssh 或 /usr/sbin 下），更早的版本根本没有该文件——
+# 早期实现只看“sshd 存在 且 /usr/lib/openssh 存在 且 sshd-session 不存在”
+# 就告警，导致 Debian 11/12、Ubuntu 20.04/22.04、Kali、Alpine、Arch、
+# Fedora、CentOS、Slackware 等所有 <9.8 的发行版每次都误报“请重装
+# openssh-server”，属纯噪音。
+sshd_major_version()
+{
+    local p ver
+    p=$(sshd_bin)
+    [ -x "${CHROOT_DIR}${p}" ] || return 1
+    # sshd -V 输出到 stderr（不同版本格式略有差异：OpenSSH_8.2p1 / OpenSSH_9.8）
+    ver=$(chroot_exec "${p}" -V 2>&1 | tr '\n' ' ' | sed -n 's/.*OpenSSH_\([0-9][0-9]*\).*/\1/p' | head -1)
+    [ -n "${ver}" ] || return 1
+    echo "${ver}"
+}
+
+# 会话组件是否就位（仅 OpenSSH 9.8+ 需要；不同发行版放置目录不同）
+ssh_session_ready()
+{
+    local d
+    for d in /usr/lib/openssh/sshd-session /usr/libexec/openssh/sshd-session \
+             /usr/sbin/sshd-session /usr/bin/sshd-session /usr/lib/ssh/sshd-session
+    do
+        [ -e "${CHROOT_DIR}${d}" ] && return 0
+    done
+    return 1
+}
+
+# sshd 配置自检：用 sshd -t 让 sshd 自己校验 host key / privsep 目录 / 配置语法。
+# 比“猜某个文件缺不缺”可靠：任何发行版、任何版本的安装残缺都会在这里暴露，
+# 且不会误报。仅告警不中断（容器仍可启动，用户可据此补装）。
+ssh_config_selftest()
+{
+    sshd_ready || return 0
+    local p out
+    p=$(sshd_bin)
+    if ! out=$(chroot_exec "${p}" -t 2>&1); then
+        msg "[警告] sshd 配置自检未通过（${p} -t）："
+        printf '%s\n' "${out}" | sed -n '1,5p' | while IFS= read -r _line; do
+            [ -n "${_line}" ] && msg "        ${_line}"
+        done
+        msg "        常见原因：host key 缺失、/run/sshd 权限异常；可在容器内重装 openssh-server 修复"
+    fi
+    return 0
+}
+
+# OpenSSH 9.8+ 的会话组件缺失时，先在容器内就地重装一次 openssh-server；
+# 仍缺失才告警（此时说明镜像源里就是残缺包，需要用户换源/手动处理）。
+ssh_session_repair()
+{
+    sshd_ready || return 0
+    local major
+    major=$(sshd_major_version)
+    # 取不到版本时按需要判定（宁可多做一次会话组件检查，也不能漏掉真实缺失）
+    if [ -n "${major}" ] && [ "${major}" -lt 9 ]; then
+        return 0
+    fi
+    ssh_session_ready && return 0
+    msg -n ":: 未检测到 SSH 会话组件（sshd-session），正在容器内修复 ... "
+    local ok=1
+    case "${DISTRIB}" in
+    debian|ubuntu|kali) apt_install --reinstall openssh-server && ok=0 ;;
+    fedora)             dnf_install --allowerasing openssh-server && ok=0 ;;
+    centos)             yum_install --allowerasing openssh-server && ok=0 ;;
+    archlinux)          pacman_install openssh && ok=0 ;;
+    alpine)             apk_install --force-overwrite openssh && ok=0 ;;
+    slackware)          slackpkg_install openssh && ok=0 ;;
+    esac
+    if [ ${ok} -eq 0 ] && ssh_session_ready; then
+        msg "完成"
+        return 0
+    fi
+    msg "未修复"
+    msg "[警告] 容器内缺少 SSH 会话组件 sshd-session（OpenSSH ${major:-9.8+}），自动重装后仍未找到。"
+    msg "        SSH 会话可能建立失败，请在容器内执行包管理器重装 openssh-server（或更换软件源后重新部署）"
+    return 1
+}
+
 # 对单个 sshd 配置文件应用统一策略（幂等）
 # $1=配置文件绝对路径（容器内路径）
 ssh_config_file_apply()
@@ -101,26 +181,17 @@ ssh_config_apply()
     # PAM 会话加固：容器内没有 systemd/audit 子系统，Debian 系 /etc/pam.d/sshd 里的
     # `session required pam_loginuid.so` 在安卓内核上写 /proc/self/loginuid 会以
     # EPERM 失败，导致“密码验证成功后连接立即被服务端关闭/重置”
-    # （sshd 在 pam_open_session 阶段中止会话，客户端表现为 Connection reset /
-    #  Connection closed by remote host）。把该模块降级为 optional 是容器环境的
-    # 标准做法（Docker 官方 openssh 镜像同样处理）；认证本身不受影响
-    # （pam_authenticate 走 common-auth，与 loginuid 无关）。
-    local pam_f
-    for pam_f in "${CHROOT_DIR}/etc/pam.d/sshd" "${CHROOT_DIR}"/etc/pam.d/common-session*
-    do
-        [ -f "${pam_f}" ] || continue
-        if grep -Eq '^[[:space:]]*session[[:space:]]+required[[:space:]]+pam_loginuid\.so' "${pam_f}" 2>/dev/null; then
-            sed -i -E 's|^([[:space:]]*session[[:space:]]+)required([[:space:]]+pam_loginuid\.so)|\1optional\2|' "${pam_f}"
-            msg ":: 已将 ${pam_f#"${CHROOT_DIR}"} 的 pam_loginuid 降级为 optional（容器内无 audit 子系统）"
-        fi
-    done
+    # （sshd 在 pam_open_session 阶段中止会话，客户端表现为 Connection closed by
+    #  remote host）。同类的 pam_systemd 也一并降级；且每次启动都重做一次，
+    # 防止 apt 升级/重装 openssh-server 后配置被还原。
+    ssh_session_harden
     # OpenSSH 9.8+ 把会话处理拆分到独立二进制 sshd-session：安装不完整时表现为
-    # “TCP 能连上、甚至能输密码，但会话建立立即失败”。这里明确告警便于定位。
-    if sshd_ready && [ -d "${CHROOT_DIR}/usr/lib/openssh" ] \
-       && [ ! -e "${CHROOT_DIR}/usr/lib/openssh/sshd-session" ]; then
-        msg "[警告] 容器内缺少 /usr/lib/openssh/sshd-session（OpenSSH 9.8+ 的会话组件），"
-        msg "        SSH 会话可能建立失败，请在容器内重装 openssh-server"
-    fi
+    # “TCP 能连上、甚至能输密码，但会话建立立即失败”。
+    # 判定必须结合容器内 sshd 的实际版本——<9.8 的发行版（Ubuntu 20.04 的 8.2p1、
+    # Debian 11/12 的 8.4/9.2、Alpine、Arch 老镜像等）本来就没有该文件，
+    # 旧实现只检查文件存在性，导致所有这类容器都误报“请重装 openssh-server”。
+    # 现在：版本 <9 直接跳过；≥9 才检查，缺失时先自动重装一次再告警。
+    ssh_session_repair
     # root 的 authorized_keys：有的发行版模板带 AuthorizedKeysFile 相对路径，
     # 统一确保 ~/.ssh 存在且权限正确（否则公钥登录/部分客户端的密钥协商会告警）
     local root_ssh="${CHROOT_DIR}/root/.ssh"
@@ -139,6 +210,106 @@ ssh_config_apply()
     if [ -e "${CHROOT_DIR}/etc/ssh/sshd_not_to_be_run" ]; then
         rm -f "${CHROOT_DIR}/etc/ssh/sshd_not_to_be_run"
         msg ":: 已移除 ${CHROOT_DIR}/etc/ssh/sshd_not_to_be_run（否则 sshd 不会启动）"
+    fi
+    return 0
+}
+
+# sshd 运行期会话加固（部署与每次启动共用，幂等）。
+# 现象：客户端能连上、能正常输入密码（服务端已通过认证），随即被服务端关闭：
+#   “Connection to x closed by remote host.”
+# 说明失败发生在认证之后的会话建立阶段（pam_open_session / 写 utmp / 会话组件），
+# 与密码无关。容器与真机的差异有三处，逐条兜住：
+#
+# 1) audit 子系统缺失：pam_loginuid 写 /proc/self/loginuid 失败，
+#    `session required pam_loginuid.so` 直接让会话中止。
+#    → 降级为 optional（Docker 官方 openssh 镜像同款处理）。
+# 2) systemd-logind 不可用：pam_systemd 调 logind 注册会话超时/失败，
+#    旧版 libpam-systemd 在容器内返回错误会让 pam_open_session 失败。
+#    → 降级为 optional。
+# 3) 发行版差异导致 ubuntu（含 Debian）不同版本写 pam 配置写法不同：
+#    `session required pam_loginuid.so` 之外还有 `session optional pam_loginuid.so`
+#    与 `@include`/`include` 公共片段，两个文件都要处理。
+# 另外 sshd 非会话相关的两类失败也一并兜住：
+#   - /run/sshd 与 /var/empty 权限：新版 OpenSSH 要求严格权限，否则会话建立失败；
+#   - 用户登录 shell 不存在（Slackware/Alpine 精简镜像常见）：sshd 认证通过后
+#     启动 shell 失败并立即断开 → 补一个可用 shell。
+ssh_session_harden()
+{
+    # 统一用 `local 名; 名=$(...)` 的写法：mksh 下 local x=$(...) 会报
+    # “typeset: ... is not an identifier” 并让变量为空（会话加固整体失效）。
+    local pam_f d user home shell cand picked
+    for pam_f in "${CHROOT_DIR}/etc/pam.d/sshd" "${CHROOT_DIR}"/etc/pam.d/common-session \
+                 "${CHROOT_DIR}"/etc/pam.d/common-session-noninteractive
+    do
+        [ -f "${pam_f}" ] || continue
+        # 注意：必须用 BRE（不带 -E、分组写 \( \)）改写。
+        # 设备端是 Android toybox 的 sed，`-E` 下的分组/反向引用会直接报
+        # “bad regex: parentheses not balanced” 且退出码非 0——旧实现把错误
+        # 用 2>/dev/null 吞掉，日志里还照常打印“已降级”，实际配置完全没改，
+        # 于是 SSH 认证通过后会话仍被 pam_loginuid 中止。
+        # 这里去掉 -E 并把 "required/requisite" 用 BRE 分支写法匹配，
+        # 替换文本也不再引用分组（保留原缩进不变）。
+        if grep -Eq '^[[:space:]]*session[[:space:]]+(required|requisite)[[:space:]]+pam_loginuid\.so' "${pam_f}" 2>/dev/null; then
+            sed -i 's/^\([[:space:]]*session[[:space:]][[:space:]]*\)required[[:space:]][[:space:]]*pam_loginuid\.so/\1optional pam_loginuid.so/' "${pam_f}"
+            sed -i 's/^\([[:space:]]*session[[:space:]][[:space:]]*\)requisite[[:space:]][[:space:]]*pam_loginuid\.so/\1optional pam_loginuid.so/' "${pam_f}"
+            msg ":: 已将 ${pam_f#"${CHROOT_DIR}"} 的 pam_loginuid 降级为 optional（容器内无 audit 子系统）"
+        fi
+        if grep -Eq '^[[:space:]]*session[[:space:]]+(required|requisite)[[:space:]]+pam_systemd\.so' "${pam_f}" 2>/dev/null; then
+            sed -i 's/^\([[:space:]]*session[[:space:]][[:space:]]*\)required[[:space:]][[:space:]]*pam_systemd\.so/\1optional pam_systemd.so/' "${pam_f}"
+            sed -i 's/^\([[:space:]]*session[[:space:]][[:space:]]*\)requisite[[:space:]][[:space:]]*pam_systemd\.so/\1optional pam_systemd.so/' "${pam_f}"
+            msg ":: 已将 ${pam_f#"${CHROOT_DIR}"} 的 pam_systemd 降级为 optional（容器内无 logind）"
+        fi
+        # pam_selinux：sshd 在认证通过后的 setcred 阶段调用 pam_selinux，
+        # 安卓容器没有 SELinux 用户态（/sys/fs/selinux 不可用、也没有
+        # /etc/selinux 策略），模块返回错误 → sshd 打印
+        #   PAM: pam_setcred(): Failure setting user credentials
+        # 并立刻 do_cleanup，客户端表现为“密码正确但连接被重置”。
+        # 真机实测（Ubuntu 20.04 + OpenSSH 8.2）：仅注释这两行即可正常登录。
+        # 容器内 SELinux 本来就不生效，直接注释（幂等，已注释则跳过）。
+        if grep -Eq '^[[:space:]]*session[^#]*pam_selinux\.so' "${pam_f}" 2>/dev/null; then
+            sed -i 's/^\([[:space:]]*session.*pam_selinux\.so.*\)$/#\1/' "${pam_f}"
+            msg ":: 已禁用 ${pam_f#"${CHROOT_DIR}"} 的 pam_selinux（容器内无 SELinux 用户态，否则 setcred 失败导致 SSH 断开）"
+        fi
+    done
+
+    # privsep 目录权限：sshd 对 /run/sshd 与 /var/empty 的所有者/权限有硬性要求
+    # （必须 root，且不可被组/其他用户写），否则 9.x 起直接在会话阶段拒绝。
+    for d in /run/sshd /var/run/sshd /var/empty
+    do
+        make_dirs "${CHROOT_DIR}${d}"
+        chown 0:0 "${CHROOT_DIR}${d}" 2>/dev/null || true
+        chmod 755 "${CHROOT_DIR}${d}" 2>/dev/null || true
+    done
+
+    # 登录 shell 兜底：sshd 认证通过后要 exec 用户的登录 shell，
+    # shell 不存在或在容器内不可执行时，sshd 立即断开连接。
+    user="${USER_NAME:-root}"
+    home=$(user_home "${user}")
+    shell=$(user_field "${user}" 7)
+    picked=""
+    case "${shell}" in
+    ''|/bin/false|/usr/bin/false|/sbin/nologin|/usr/sbin/nologin) picked="need" ;;
+    *)
+        [ -x "${CHROOT_DIR}${shell}" ] || picked="need"
+    ;;
+    esac
+    if [ "${picked}" = "need" ]; then
+        for cand in /bin/bash /usr/bin/bash /bin/ash /bin/sh /usr/bin/sh
+        do
+            if [ -x "${CHROOT_DIR}${cand}" ]; then picked="${cand}"; break; fi
+        done
+        [ "${picked}" != "need" ] || picked=""
+        if [ -n "${picked}" ]; then
+            msg ":: ${user} 的登录 shell 为 ${shell:-空}（不可用），已修正为 ${picked}（否则 SSH 登录后立即断开）"
+            chroot_exec usermod -s "${picked}" "${user}" >/dev/null 2>&1 \
+                || sed -i "s|^\(${user}:.*:\)[^:]*$|\1${picked}|" "${CHROOT_DIR}/etc/passwd" 2>/dev/null || true
+        fi
+    fi
+    # 家目录必须存在（sshd 某些配置会在登录前 chdir 到 home）
+    if [ -n "${home}" ] && [ "${home}" != "/" ] && [ "${home}" != "/nonexistent" ]; then
+        make_dirs "${CHROOT_DIR}${home}"
+        chown -R "${user}:${user}" "${CHROOT_DIR}${home}" 2>/dev/null \
+            || chown -R 0:0 "${CHROOT_DIR}${home}" 2>/dev/null || true
     fi
     return 0
 }
@@ -230,6 +401,9 @@ do_configure()
 {
     msg ":: 正在配置 ${COMPONENT} ... "
     ssh_config_apply
+    # 配置自检：让 sshd 自己校验（host key / privsep / 语法），
+    # 覆盖所有发行版，避免“装上了但起不来”拖到用户连 SSH 时才发现。
+    ssh_config_selftest
     # Alpine：OpenRC 的 sshd 服务默认不随 runlevel 启动，部署时 enable；
     # 交由 init/openrc 在容器启动时按 runlevels 拉起（不在此处直接起进程）。
     case "${DISTRIB}" in
@@ -248,13 +422,38 @@ do_configure()
 do_start()
 {
     msg -n ":: Starting ${COMPONENT} ... "
+    # 最高优先级：privsep 目录必须在“任何 sshd 进程存在性判断”之前建好。
+    # /run 在容器里通常是 tmpfs，容器每次停止都会被清空；而 sshd 一启动就检查
+    # `Missing privilege separation directory: /run/sshd` 并直接退出（会话阶段
+    # 也会再次校验）。此前这里先做 sshd_running 判断、并在“已在运行”时提前
+    # return，导致 /run/sshd 永远不被重建——表现为“能连上、输完密码被断开”。
+    make_dirs "${CHROOT_DIR}/run/sshd" "${CHROOT_DIR}/var/run/sshd" "${CHROOT_DIR}/var/empty"
+    chown 0:0 "${CHROOT_DIR}/run/sshd" "${CHROOT_DIR}/var/run/sshd" "${CHROOT_DIR}/var/empty" 2>/dev/null || true
+    chmod 755 "${CHROOT_DIR}/run/sshd" "${CHROOT_DIR}/var/run/sshd" "${CHROOT_DIR}/var/empty" 2>/dev/null || true
+    # 启动前兜底：会话组件缺失（OpenSSH 9.8+ 安装残缺/被误删）时自行修复，
+    # 否则“能连上、输完密码会话立即失败”，且用户没有任何线索。
+    ssh_session_repair >/dev/null 2>&1 || true
     # 每次启动重新应用一次 sshd 配置（端口 / 密码登录 / root 登录 / 键盘交互 /
-    # privsep 目录 / host key）：do_configure 只在部署时执行，历史容器、
-    # 或"改了密码/端口后重启容器"的场景需要靠这里兜底。旧实现仅 systemctl
-    # 模式生效，sysv/run-parts/OpenRC 下配置不刷新（表现为改了密码仍连不上）。
-    ssh_config_apply >/dev/null 2>&1
-    # systemctl 模式：ssh 由 systemctl 管理（ssh.service / sshd.service），CLI 不直启
+    # privsep 目录 / host key / PAM 会话加固）：do_configure 只在部署时执行，
+    # 历史容器、或"改了密码/端口后重启容器"的场景需要靠这里兜底。
+    # 注意不能把输出丢到 /dev/null：PAM 加固失败时（例如 setcred 出错导致
+    # SSH 认证后被断开）用户需要从启动日志里看到具体改了哪些文件。
+    ssh_config_apply
+    # systemctl 模式：ssh 由 systemctl 管理（ssh.service / sshd.service），CLI 不直启。
+    # 但组件执行顺序是 init/systemctl 先拉起 sshd，本组件随后才加固 PAM——
+    # 加固写进文件后已运行的 sshd 仍用旧 PAM 栈，必须让它重新加载配置。
+    # 这里重启一次 ssh 服务（sshd 每次会话都会重新读 PAM 配置，重启最稳妥）；
+    # 重启失败不影响后续流程（下次启动容器时仍会应用）。
     if [ "${INIT}" = "systemctl" ]; then
+        local svc
+        for svc in ssh.service sshd.service; do
+            if [ -e "${CHROOT_DIR}/etc/systemd/system/${svc}" ] \
+               || [ -e "${CHROOT_DIR}/lib/systemd/system/${svc}" ] \
+               || [ -e "${CHROOT_DIR}/usr/lib/systemd/system/${svc}" ]; then
+                chroot_exec /usr/bin/systemctl restart "${svc}" >/dev/null 2>&1 || true
+                break
+            fi
+        done
         msg "跳过（systemctl 模式：ssh 由 systemctl 管理，端口 ${SSH_PORT} 已写入 sshd_config）"
         return 0
     fi
@@ -284,7 +483,32 @@ do_start()
     make_dirs "${CHROOT_DIR}/run/sshd" "${CHROOT_DIR}/var/run/sshd"
     local sshd
     sshd=$(sshd_bin)
-    # sysv/run-parts 模式下若 rc 脚本未启动 ssh，这里兜底直接拉起
+    # sysv/run-parts 模式下的兜底：初始化脚本可能因缺少 sshd 的启动脚本
+    # （Arch/Slackware 的 /etc/rc.d/sshd 未安装、SysV 的 rcN.d 里没有 S??ssh）
+    # 而没有拉起 sshd。这里先尝试发行版自带的启动脚本，失败再直接拉起。
+    sysv_runparts_sshd_start()
+    {
+        local f
+        for f in "${CHROOT_DIR}/etc/init.d/ssh" "${CHROOT_DIR}/etc/init.d/sshd" \
+                 "${CHROOT_DIR}/etc/rc.d/sshd" "${CHROOT_DIR}/etc/rc.d/rc.sshd"
+        do
+            [ -x "${f}" ] || continue
+            chroot_exec -u root "${f#"${CHROOT_DIR}"}" start >/dev/null 2>&1 || true
+            sshd_running && return 0
+        done
+        return 1
+    }
+    if [ "${INIT}" = "sysv" ] || [ "${INIT}" = "run-parts" ]; then
+        if sysv_runparts_sshd_start; then
+            if ssh_listening; then
+                msg "完成（发行版脚本已启动 sshd，端口 ${SSH_PORT} 已监听）"
+            else
+                msg "完成（发行版脚本已启动 sshd）"
+            fi
+            return 0
+        fi
+    fi
+    # 兜底直接拉起
     if [ "${METHOD}" = "proot" ]; then
         chroot_exec -u root fakechroot ${sshd} -p ${SSH_PORT} ${SSH_ARGS} &
     else
@@ -308,6 +532,16 @@ do_start()
         msg "失败"
         msg "[提示] sshd 未能启动：可在终端执行 ${sshd} -D -p ${SSH_PORT} 查看具体报错。"
         msg "        常见原因：host key 缺失（执行 ssh-keygen -A）、端口被占用、配置语法错误。"
+        # 把 sshd 自己的诊断信息（含 -t 校验结果）打到部署/启动日志里，
+        # 避免用户只能看到一句“失败”而无从排查。
+        local _diag
+        _diag=""
+        _diag=$(chroot_exec "${sshd}" -t 2>&1 | sed -n '1,8p')
+        if [ -n "${_diag}" ]; then
+            printf '%s\n' "${_diag}" | while IFS= read -r _line; do
+                [ -n "${_line}" ] && msg "        ${_line}"
+            done
+        fi
     fi
     return 0
 }

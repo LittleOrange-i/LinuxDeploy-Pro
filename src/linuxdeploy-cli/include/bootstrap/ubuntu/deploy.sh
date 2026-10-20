@@ -138,6 +138,8 @@ do_install()
     local DEBOOTSTRAP_DIR rc_file debootstrap_rc
     DEBOOTSTRAP_DIR="$(component_dir bootstrap/debian)/debootstrap"
     mkdir -p "${TEMP_DIR}" 2>/dev/null || true
+    # 先声明再单独赋值（原因同 bootstrap/debian：mksh 下 local x=$(...) 会失败）
+    rc_file=""
     rc_file=$(mktemp "${TEMP_DIR}/ld-debootstrap.XXXXXX") || return 1
 
     # 一阶段：仅解包基础系统到目标目录
@@ -199,6 +201,7 @@ do_install()
 
     # 二阶段：在 chroot 内完成包配置
     unset DEBOOTSTRAP_DIR
+    rc_file=""
     rc_file=$(mktemp "${TEMP_DIR}/ld-second.XXXXXX") || return 1
     (
         chroot_exec /debootstrap/debootstrap --no-check-gpg --second-stage 2>&1

@@ -116,6 +116,9 @@ fun MainScreen(
     var deleteTarget by remember { mutableStateOf<String?>(null) }
     // 部署目标目录非空时待确认的配置（触发"强制部署"确认窗）
     var pendingForceDeploy by remember { mutableStateOf<ContainerConfig?>(null) }
+    // 本次运行中已成功部署过的容器目录：这些目录里的内容就是我们刚装好的系统，
+    // 再次部署时不必再弹"目标目录非空/强制部署"确认（CLI 只在该目录上覆盖安装）。
+    val deployedDirs = remember { mutableStateListOf<String>() }
     // 删除容器两步确认：第一步勾选弹窗目标
     var deleteContainerTarget by remember { mutableStateOf<ContainerConfig?>(null) }
     // 删除容器勾选"同时删除配置文件"
@@ -538,6 +541,7 @@ fun MainScreen(
             label = "部署 ${cfg.name}",
             op = { onLine -> CliManager.deploy(context, cfg.name, onLine) },
             onSuccess = {
+                deployedDirs.add(cfg.path)
                 Toast.makeText(context, "部署完成", Toast.LENGTH_SHORT).show()
             },
             autoShowLog = true,
@@ -550,16 +554,27 @@ fun MainScreen(
      * 部署容器：先检查目标目录是否非空。
      * 非空（已部署/残留数据）→ 弹"强制部署"确认（后果自负）→ 确认后才真正执行；
      * 目录为空 → 直接部署。
+     *
+     * @param force 用户已确认强制部署（点击确认框里的"强制部署"）：
+     *   跳过目录检查直接执行。否则确认框关闭后再次进入本函数、又会查一次目录，
+     *   必然再次得到"非空"→ 重新弹框，形成点不完的对话框。
      */
-    fun deployConfig(cfg: ContainerConfig) {
+    fun deployConfig(cfg: ContainerConfig, force: Boolean = false) {
         if (busy) {
             Toast.makeText(context, "有操作正在进行，请稍候", Toast.LENGTH_SHORT).show()
             return
         }
+        if (force) {
+            doDeploy(cfg)
+            return
+        }
         scope.launch {
+            // 同一次运行里刚部署成功（目录必然为空）：跳过检查，避免多一道
+            // “目标目录非空”关卡把正常的重试/再部署挡在确认框后面。
+            val knownEmpty = deployedDirs.contains(cfg.path)
             val checkResult = withContext(Dispatchers.IO) {
                 try {
-                    CliManager.isTargetDirNonEmpty(context, cfg.name)
+                    CliManager.isTargetDirNonEmpty(context, cfg.name, knownEmpty)
                 } catch (_: Exception) {
                     Pair<Boolean?, String>(null, "check 异常")
                 }
@@ -1035,7 +1050,8 @@ fun MainScreen(
                 destructive = true,
                 onConfirm = {
                     pendingForceDeploy = null
-                    doDeploy(cfg)
+                    // 用户已确认强制部署：直接执行，不能再走一次目录检查（否则又弹框）
+                    deployConfig(cfg, force = true)
                 },
                 onDismiss = { pendingForceDeploy = null },
             )
