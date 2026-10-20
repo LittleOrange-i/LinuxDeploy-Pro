@@ -254,10 +254,18 @@ ssh_session_harden()
             sed -i 's/^\([[:space:]]*session[[:space:]][[:space:]]*\)requisite[[:space:]][[:space:]]*pam_loginuid\.so/\1optional pam_loginuid.so/' "${pam_f}"
             msg ":: 已将 ${pam_f#"${CHROOT_DIR}"} 的 pam_loginuid 降级为 optional（容器内无 audit 子系统）"
         fi
-        if grep -Eq '^[[:space:]]*session[[:space:]]+(required|requisite)[[:space:]]+pam_systemd\.so' "${pam_f}" 2>/dev/null; then
-            sed -i 's/^\([[:space:]]*session[[:space:]][[:space:]]*\)required[[:space:]][[:space:]]*pam_systemd\.so/\1optional pam_systemd.so/' "${pam_f}"
-            sed -i 's/^\([[:space:]]*session[[:space:]][[:space:]]*\)requisite[[:space:]][[:space:]]*pam_systemd\.so/\1optional pam_systemd.so/' "${pam_f}"
-            msg ":: 已将 ${pam_f#"${CHROOT_DIR}"} 的 pam_systemd 降级为 optional（容器内无 logind）"
+        # pam_systemd：sshd 在认证通过后会调用 pam_setcred(PAM_ESTABLISH_CRED)，
+        # 该模块尝试连接 D-Bus 注册会话，容器内没有 systemd/logind
+        # （auth.log: pam_systemd(sshd:session): Failed to connect to system bus），
+        # 返回错误后 sshd 打印 fatal: PAM: pam_setcred(): Failure setting user
+        # credentials 并关闭连接。注意：把它降级为 optional **不够**——
+        # 失败发生在 setcred 阶段，与 session 的 required/optional 无关，
+        # 必须整行注释掉（容器内本就没有 logind，功能为零）。
+        # 真机实测：注释后 session opened 与 session closed 正常间隔（可保持会话），
+        # 不注释时 session opened/closed 出现在同一秒。
+        if grep -Eq '^[[:space:]]*session[^#]*pam_systemd\.so' "${pam_f}" 2>/dev/null; then
+            sed -i 's/^\([[:space:]]*session.*pam_systemd\.so.*\)$/#\1/' "${pam_f}"
+            msg ":: 已禁用 ${pam_f#"${CHROOT_DIR}"} 的 pam_systemd（容器内无 D-Bus/logind）"
         fi
         # pam_selinux：sshd 在认证通过后的 setcred 阶段调用 pam_selinux，
         # 安卓容器没有 SELinux 用户态（/sys/fs/selinux 不可用、也没有
