@@ -16,8 +16,8 @@ android {
         minSdk = 28
         // targetSdk 36：Android 16，启用新一代系统行为与特性
         targetSdk = 36
-        versionCode = 40122
-        versionName = "4.1.22"
+        versionCode = 40123
+        versionName = "4.1.23"
     }
 
     signingConfigs {

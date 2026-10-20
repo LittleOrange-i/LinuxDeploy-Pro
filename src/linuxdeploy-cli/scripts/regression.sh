@@ -58,6 +58,8 @@ check "extra/ssh 部署期确定性启用 ssh.service" \
   "grep -q 'multi-user.target.wants' include/extra/ssh/deploy.sh"
 check "extra/ssh systemctl 模式启动后回读验证" \
   "grep -q '未检测到 sshd 进程' include/extra/ssh/deploy.sh"
+check "sshd 容器内禁用 PAM（UsePAM no，规避 pam_setcred 复放失败码）" \
+  "grep -q 'UsePAM no' include/extra/ssh/deploy.sh"
 
 # 6. 组件系统
 check "组件列表（当前发行版兼容）" "./cli.sh config list >/dev/null && ./cli.sh --help >/dev/null"

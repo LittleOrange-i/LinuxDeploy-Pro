@@ -133,13 +133,21 @@ ssh_config_file_apply()
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*PermitRootLogin[[:space:]].*/PermitRootLogin yes/' "${cfg}" 2>/dev/null || true
     # 部分精简发行版模板默认禁止空密码账号，这里放宽（root 密码由 core/profile 设置）
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*PermitEmptyPasswords[[:space:]].*/PermitEmptyPasswords yes/' "${cfg}" 2>/dev/null || true
-    sed -i -E 's/^[[:space:]]*#?[[:space:]]*UsePAM[[:space:]].*/UsePAM yes/' "${cfg}" 2>/dev/null || true
-    # 键盘交互认证：Debian 系模板显式写了 KbdInteractiveAuthentication no，
-    # 部分客户端会优先协商该方式（UsePAM 下同样走 PAM 校验密码），关闭时
-    # 表现为"能连上但密码被拒"。这里与密码认证一起放开，保证各发行版行为一致；
-    # 旧版 OpenSSH（Ubuntu 20.04 等）用 ChallengeResponseAuthentication 同名选项。
-    sed -i -E 's/^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication[[:space:]].*/KbdInteractiveAuthentication yes/' "${cfg}" 2>/dev/null || true
-    sed -i -E 's/^[[:space:]]*#?[[:space:]]*ChallengeResponseAuthentication[[:space:]].*/ChallengeResponseAuthentication yes/' "${cfg}" 2>/dev/null || true
+    # 认证栈：容器内禁用 PAM，由 sshd 直接校验 /etc/shadow。
+    # 真机实测（2026-10-20，目录容器 + Ubuntu focal + OpenSSH 8.2）：UsePAM yes 时
+    # OpenSSH 认证前会先用 "none" 方法探测一次 PAM，pam_unix 在该次 authenticate 中
+    # 失败并把返回码记入 PAM handle；随后的 pam_setcred(PAM_ESTABLISH_CRED) 复放该
+    # 失败码 → auth.log 显示认证成功（Accepted keyboard-interactive/pam）却紧跟
+    #   fatal: PAM: pam_setcred(): Failure setting user credentials
+    # 客户端表现为“密码正确后 Connection reset by peer”。逐一降级 pam_loginuid/
+    # pam_selinux/pam_systemd、移除 nullok(_secure)、pam_cap、以及自定 bracket 认证栈
+    # （auth_err/cred_* 全部 ignore + pam_permit 收尾）均无法绕开；UsePAM no 后
+    # sshd 直接走 shadow 校验，正确密码可登录、错误密码正常拒绝，问题彻底消失。
+    # 容器内不需要 PAM 会话特性（motd/env/limits 仅为可选装饰）。键盘交互认证
+    # 依赖 PAM 后端，一并关闭（客户端自动回退到标准 password 方式）。
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*UsePAM[[:space:]].*/UsePAM no/' "${cfg}" 2>/dev/null || true
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*KbdInteractiveAuthentication[[:space:]].*/KbdInteractiveAuthentication no/' "${cfg}" 2>/dev/null || true
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*ChallengeResponseAuthentication[[:space:]].*/ChallengeResponseAuthentication no/' "${cfg}" 2>/dev/null || true
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*AcceptEnv[[:space:]].*/AcceptEnv LANG/' "${cfg}" 2>/dev/null || true
     # 端口写回配置文件（systemctl 模式经 ssh.service 启动时没有 -p 参数）
     sed -i -E 's/^[[:space:]]*#?[[:space:]]*Port[[:space:]].*/Port '"${SSH_PORT}"'/' "${cfg}" 2>/dev/null || true
@@ -546,6 +554,11 @@ do_start()
             msg "完成（systemctl 模式：${restarted:-ssh} 已拉起，端口 ${SSH_PORT} 已监听）"
         elif sshd_running; then
             msg "警告：sshd 进程在运行，但端口 ${SSH_PORT} 未监听（可能是其它容器/宿主服务占用了该端口）"
+        elif ssh_listening; then
+            # 端口有人监听但不是本容器的 sshd：多容器/宿主服务占用，
+            # 本容器 sshd 绑定失败（客户端会连到占口方，密码对不上）
+            msg "警告：端口 ${SSH_PORT} 已被其它进程监听（非本容器 sshd，可能是其它容器或宿主服务）"
+            msg "        本容器 sshd 无法绑定该端口；请到配置页把本容器端口改成其它值后重新启动"
         else
             msg "失败（systemctl 模式下未检测到 sshd 进程，端口 ${SSH_PORT} 未监听）"
             msg "      可进入容器执行 /usr/bin/systemctl status ssh.service 排查；下方为 sshd 自检结果："
