@@ -8,7 +8,7 @@
 #
 ################################################################################
 
-VERSION="4.1.21"
+VERSION="4.1.22"
 
 ################################################################################
 # 公共工具
@@ -2000,7 +2000,7 @@ mount_part()
             msg "跳过"
         fi
     ;;
-    shm)
+    shm|dev/shm)
         msg -n "/dev/shm ... "
         if ! is_mounted "/dev/shm" ; then
             [ -d "/dev/shm" ] || mkdir -p /dev/shm
@@ -2014,7 +2014,7 @@ mount_part()
             msg "跳过"
         fi
     ;;
-    pts)
+    pts|dev/pts)
         msg -n "/dev/pts ... "
         local pts_target="${CHROOT_DIR}/dev/pts"
         if ! is_mounted "${pts_target}" ; then

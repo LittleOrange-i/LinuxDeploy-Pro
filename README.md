@@ -15,7 +15,7 @@ src/
 
 ## 版本
 
-当前版本：**4.1.21**（CLI `VERSION` 与 App `versionCode 40121 / versionName 4.1.21` 保持一致；App 内置 CLI 资源的解压标记按 assets 内容指纹自动更新，版本变化时自动重新解压）。
+当前版本：**4.1.22**（CLI `VERSION` 与 App `versionCode 40122 / versionName 4.1.22` 保持一致；App 内置 CLI 资源的解压标记按 assets 内容指纹自动更新，版本变化时自动重新解压）。
 
 ## 构建
 

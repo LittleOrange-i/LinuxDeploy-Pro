@@ -464,6 +464,33 @@ do_configure()
         fi
     ;;
     esac
+    # 安装期确定性启用 ssh 服务（不依赖任何 systemctl 实现，幂等）：
+    # 部署期组件顺序是 init/systemctl 先于 extra/ssh —— 走到这里时容器内的
+    # /usr/bin/systemctl 已被换成 python 假实现，openssh-server 安装脚本里
+    # deb-systemd-helper 的 `systemctl preset` 落在假实现上会返回失败
+    # （实测部署日志：deb-systemd-helper: error: systemctl preset failed on
+    #  ssh.service），ssh.service 在安装期没有被启用。此前唯一的兜底是“启动时
+    # systemctl enable”（2>/dev/null || true，失败无任何日志），一旦失败，
+    # init 的 default.target 里就没有 ssh —— 容器启动后 sshd 永不运行，
+    # 表现为“部署成功但 SSH 无法登录”。这里直接落 wants 软链，
+    # 让启用动作不依赖 preset/enable 命令是否可用。
+    local unit unit_f
+    for unit in ssh.service sshd.service; do
+        unit_f=""
+        if [ -e "${CHROOT_DIR}/usr/lib/systemd/system/${unit}" ]; then
+            unit_f="/usr/lib/systemd/system/${unit}"
+        elif [ -e "${CHROOT_DIR}/lib/systemd/system/${unit}" ]; then
+            unit_f="/lib/systemd/system/${unit}"
+        fi
+        [ -n "${unit_f}" ] || continue
+        # 仅启用声明了 WantedBy 的 unit（static 单元落链无意义）
+        grep -q '^WantedBy=' "${CHROOT_DIR}${unit_f}" 2>/dev/null || continue
+        make_dirs "${CHROOT_DIR}/etc/systemd/system/multi-user.target.wants"
+        if [ ! -e "${CHROOT_DIR}/etc/systemd/system/multi-user.target.wants/${unit}" ]; then
+            ln -sf "${unit_f}" "${CHROOT_DIR}/etc/systemd/system/multi-user.target.wants/${unit}" 2>/dev/null \
+                && msg ":: 已启用 ${unit}（写入 multi-user.target.wants，安装期确定性启用）"
+        fi
+    done
     # 注：systemctl 模式下 ssh.service 的 enable 由 init/systemctl 组件在 start
     # 拉起 --init 前统一执行，此处不再调用 python systemctl。
     return 0
@@ -495,16 +522,35 @@ do_start()
     # 这里重启一次 ssh 服务（sshd 每次会话都会重新读 PAM 配置，重启最稳妥）；
     # 重启失败不影响后续流程（下次启动容器时仍会应用）。
     if [ "${INIT}" = "systemctl" ]; then
-        local svc
+        local svc restarted=""
         for svc in ssh.service sshd.service; do
             if [ -e "${CHROOT_DIR}/etc/systemd/system/${svc}" ] \
                || [ -e "${CHROOT_DIR}/lib/systemd/system/${svc}" ] \
                || [ -e "${CHROOT_DIR}/usr/lib/systemd/system/${svc}" ]; then
                 chroot_exec /usr/bin/systemctl restart "${svc}" >/dev/null 2>&1 || true
+                restarted="${svc}"
                 break
             fi
         done
-        msg "跳过（systemctl 模式：ssh 由 systemctl 管理，端口 ${SSH_PORT} 已写入 sshd_config）"
+        # 回读验证（修复“静默跳过”）：systemctl 模式下 sshd 由 init 拉起，此前
+        # 无论是否真的启动都只打印“跳过”——init 未起、enable 失败、sshd 崩溃
+        # 等情况在日志里没有任何线索，用户只能看到“部署成功但 SSH 无法登录”。
+        # 这里等待并确认进程与监听口；失败时把 sshd 自检结果打到日志。
+        local i=0
+        while [ ${i} -lt 20 ]; do
+            sshd_running && ssh_listening && break
+            sleep 0.5
+            i=$((i+1))
+        done
+        if sshd_running && ssh_listening; then
+            msg "完成（systemctl 模式：${restarted:-ssh} 已拉起，端口 ${SSH_PORT} 已监听）"
+        elif sshd_running; then
+            msg "警告：sshd 进程在运行，但端口 ${SSH_PORT} 未监听（可能是其它容器/宿主服务占用了该端口）"
+        else
+            msg "失败（systemctl 模式下未检测到 sshd 进程，端口 ${SSH_PORT} 未监听）"
+            msg "      可进入容器执行 /usr/bin/systemctl status ssh.service 排查；下方为 sshd 自检结果："
+            ssh_config_selftest
+        fi
         return 0
     fi
     # 已由 init（sysv/run-parts/openrc）拉起的 sshd 不重复启动

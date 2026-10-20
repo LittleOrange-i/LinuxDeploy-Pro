@@ -5609,7 +5609,19 @@ class Systemctl:
         for unit in units:
             status = self.unitfiles.get_preset_of_unit(unit)
             if not status:
-                continue
+                # Linux Deploy 修复（2026-10）：preset 文件未覆盖的单元按 systemd
+                # 默认策略视为 enable（systemd.preset(5) 语义：未被 preset 行匹配
+                # 的单元默认启用）。原实现直接 continue → found=0 → 整体返回失败，
+                # 容器内 deb-systemd-helper 的 `systemctl preset` 因此全部失败
+                # （实测部署日志：deb-systemd-helper: error: systemctl preset
+                #  failed on ssh.service: No such file or directory —— 其中的
+                # "No such file or directory" 是 perl $! 的陈旧 errno，真实原因
+                # 就是这里返回了非零），ssh.service 在安装期从未被启用，容器启动
+                # 后 sshd 能否运行完全依赖启动期的兜底 enable，一旦失败即表现为
+                # “部署成功但 SSH 无法登录”。preset --disable 模式不默认启用。
+                if self._preset_mode == "disable":
+                    continue
+                status = "enable"
             found += 1
             if status.startswith("enable"):
                 if self._preset_mode == "disable":

@@ -49,6 +49,16 @@ check "normalize_packages 已实现" "grep -q normalize_packages cli.sh"
 check "时间戳日志命名已实现" "grep -q \"date '+%Y%m%d-%H%M%S'\" cli.sh"
 check "TARGET_TYPE 持久化键已实现" "grep -q TARGET_TYPE cli.sh"
 
+# 5b. SSH 无法登录修复（2026-10-20）自检
+check "mount_part 接受 dev/shm、dev/pts 别名（修复补挂只挂 proc/sys）" \
+  "grep -q 'shm|dev/shm' cli.sh && grep -q 'pts|dev/pts' cli.sh"
+check "systemctl preset 默认策略修复（未匹配 preset 的单元默认 enable）" \
+  "grep -q 'preset 文件未覆盖的单元按 systemd' include/init/systemctl/systemctl.py"
+check "extra/ssh 部署期确定性启用 ssh.service" \
+  "grep -q 'multi-user.target.wants' include/extra/ssh/deploy.sh"
+check "extra/ssh systemctl 模式启动后回读验证" \
+  "grep -q '未检测到 sshd 进程' include/extra/ssh/deploy.sh"
+
 # 6. 组件系统
 check "组件列表（当前发行版兼容）" "./cli.sh config list >/dev/null && ./cli.sh --help >/dev/null"
 
