@@ -1,7 +1,7 @@
 #!/bin/sh
 # Linux Deploy Component
 # (c) Anton Skshidlevsky <meefik@gmail.com>, GPLv3
-# 维护：GanYu256（各发行版兼容修复）
+# 维护：LittleOrange-i（各发行版兼容修复）
 
 [ -n "${SUITE}" ] || SUITE="latest-stable"
 

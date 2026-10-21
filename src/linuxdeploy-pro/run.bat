@@ -13,7 +13,7 @@ rem ============================================================
 setlocal
 cd /d "%~dp0"
 
-set PKG=io.github.ganyu256.linuxdeploypro
+set PKG=io.github.LittleOrange.linuxdeploypro
 
 rem --- 环境自检：adb 必须可用 ---
 where adb >nul 2>nul

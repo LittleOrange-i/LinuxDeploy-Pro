@@ -1,6 +1,6 @@
-package io.github.ganyu256.linuxdeploypro.ui
+package io.github.LittleOrange.linuxdeploypro.ui
 
-import io.github.ganyu256.linuxdeploypro.BuildConfig
+import io.github.LittleOrange.linuxdeploypro.BuildConfig
 import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement

@@ -1,10 +1,10 @@
-package io.github.ganyu256.linuxdeploypro.data
+package io.github.LittleOrange.linuxdeploypro.data
 
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import io.github.ganyu256.linuxdeploypro.BuildConfig
+import io.github.LittleOrange.linuxdeploypro.BuildConfig
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile

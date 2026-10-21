@@ -5,13 +5,13 @@ plugins {
 
 android {
     // 新包名：与原版 ru.meefik.linuxdeploy 彻底区分
-    namespace = "io.github.ganyu256.linuxdeploypro"
+    namespace = "io.github.LittleOrange.linuxdeploypro"
     // compileSdk 37：仅编译基线。Miuix 0.9.3 / core-ktx 1.19.0 已按 37 编译，
     // 若不跟进会触发 AAR 元数据校验失败。targetSdk 仍保持 36（Android 16 行为）。
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "io.github.ganyu256.linuxdeploypro"
+        applicationId = "io.github.LittleOrange.linuxdeploypro"
         // minSdk 28：Android 9，兼顾老设备；私有二进制执行限制也以 28 为基线
         minSdk = 28
         // targetSdk 36：Android 16，启用新一代系统行为与特性

@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro
+package io.github.LittleOrange.linuxdeploypro
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity

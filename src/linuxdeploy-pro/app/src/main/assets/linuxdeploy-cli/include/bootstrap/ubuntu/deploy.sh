@@ -1,7 +1,7 @@
 #!/bin/sh
 # Linux Deploy 组件：Ubuntu 引导
 # (c) Anton Skshidlevsky <meefik@gmail.com>, GPLv3
-# 维护：GanYu256（CLI 4.0 重构，中文注释与日志）
+# 维护：LittleOrange-i（CLI 4.0 重构，中文注释与日志）
 #
 # 说明：与 bootstrap/debian 共用同一套内置官方 debootstrap（scripts 目录
 # 含 jammy/noble/focal 等 Ubuntu 代号脚本），安装流程完全一致；

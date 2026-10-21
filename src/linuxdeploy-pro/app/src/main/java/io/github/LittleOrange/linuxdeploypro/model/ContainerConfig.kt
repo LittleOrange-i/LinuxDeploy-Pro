@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro.model
+package io.github.LittleOrange.linuxdeploypro.model
 
 /**
  * 容器配置：与 CLI 4.0 的 config create / config edit 参数一一对应。

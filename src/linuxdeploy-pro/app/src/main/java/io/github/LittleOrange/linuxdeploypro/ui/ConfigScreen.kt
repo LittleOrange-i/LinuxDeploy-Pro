@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro.ui
+package io.github.LittleOrange.linuxdeploypro.ui
 
 import android.widget.Toast
 import androidx.compose.foundation.clickable
@@ -35,8 +35,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import io.github.ganyu256.linuxdeploypro.data.StorageValidator
-import io.github.ganyu256.linuxdeploypro.model.ContainerConfig
+import io.github.LittleOrange.linuxdeploypro.data.StorageValidator
+import io.github.LittleOrange.linuxdeploypro.model.ContainerConfig
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults

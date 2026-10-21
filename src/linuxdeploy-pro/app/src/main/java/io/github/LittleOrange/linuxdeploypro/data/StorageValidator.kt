@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro.data
+package io.github.LittleOrange.linuxdeploypro.data
 
 import android.content.Context
 

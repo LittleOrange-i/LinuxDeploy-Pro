@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro.ui.theme
+package io.github.LittleOrange.linuxdeploypro.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable

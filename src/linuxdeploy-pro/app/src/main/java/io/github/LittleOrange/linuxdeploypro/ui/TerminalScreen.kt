@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro.ui
+package io.github.LittleOrange.linuxdeploypro.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -41,7 +41,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import io.github.ganyu256.linuxdeploypro.data.CliManager
+import io.github.LittleOrange.linuxdeploypro.data.CliManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Icon

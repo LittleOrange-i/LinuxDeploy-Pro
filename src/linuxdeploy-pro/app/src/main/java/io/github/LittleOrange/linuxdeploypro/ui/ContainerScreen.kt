@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro.ui
+package io.github.LittleOrange.linuxdeploypro.ui
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -39,8 +39,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import io.github.ganyu256.linuxdeploypro.R
-import io.github.ganyu256.linuxdeploypro.model.ContainerConfig
+import io.github.LittleOrange.linuxdeploypro.R
+import io.github.LittleOrange.linuxdeploypro.model.ContainerConfig
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon

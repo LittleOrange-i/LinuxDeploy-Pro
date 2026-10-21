@@ -24,7 +24,7 @@ CLI（`../linuxdeploy-cli`）为唯一数据源，前端通过 `su -c` 调用 `c
 - 设置：主题（跟随系统 / 浅色 / 纯黑 AMOLED）、重装运行环境、关于
 - 无障碍：导航项语义、图标 contentDescription、按钮 Role
 - 安全：allowBackup=false、无明文 HTTP、详情页不展示明文密码
-- 包名 `io.github.ganyu256.linuxdeploypro`
+- 包名 `io.github.LittleOrange.linuxdeploypro`
 - 启动图标：蓝紫渐变 + 终端提示符（自适应图标，支持 Android 13 单色图标）
 
 ## 技术栈
@@ -60,7 +60,7 @@ scripts/sync-cli.sh           # 同步后需人工 review git status 再提交
 ```
 
 工具链静态二进制（tools/）由 `buildtools/build.sh` 构建后部署，见
-`/root/Ganyu256/buildtools/build.sh`。
+`/root/LittleOrange-i/buildtools/build.sh`。
 
 ## 目录约定
 

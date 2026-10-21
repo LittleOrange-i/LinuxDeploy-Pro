@@ -1,6 +1,6 @@
-package io.github.ganyu256.linuxdeploypro.ui
+package io.github.LittleOrange.linuxdeploypro.ui
 
-import io.github.ganyu256.linuxdeploypro.BuildConfig
+import io.github.LittleOrange.linuxdeploypro.BuildConfig
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -36,9 +36,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import io.github.ganyu256.linuxdeploypro.data.CliManager
-import io.github.ganyu256.linuxdeploypro.data.KeepAlivePrefs
-import io.github.ganyu256.linuxdeploypro.ui.theme.ThemeMode
+import io.github.LittleOrange.linuxdeploypro.data.CliManager
+import io.github.LittleOrange.linuxdeploypro.data.KeepAlivePrefs
+import io.github.LittleOrange.linuxdeploypro.ui.theme.ThemeMode
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
@@ -217,16 +217,16 @@ fun SettingsScreen(
                 Column {
                     ArrowPreference(
                         title = "作者",
-                        summary = "GanYu256",
-                        onClick = { openUrl(context, "https://github.com/GanYu256") },
+                        summary = "LittleOrange-i",
+                        onClick = { openUrl(context, "https://github.com/LittleOrange-i") },
                     )
                     ArrowPreference(
                         title = "开源地址",
-                        summary = "github.com/GanYu256/LinuxDeploy-Pro",
-                        onClick = { openUrl(context, "https://github.com/GanYu256/LinuxDeploy-Pro") },
+                        summary = "github.com/LittleOrange-i/LinuxDeploy-Pro",
+                        onClick = { openUrl(context, "https://github.com/LittleOrange-i/LinuxDeploy-Pro") },
                     )
                     AboutInfoLine("版本", "v${BuildConfig.VERSION_NAME}")
-                    AboutInfoLine("包名", "io.github.ganyu256.linuxdeploypro")
+                    AboutInfoLine("包名", "io.github.LittleOrange.linuxdeploypro")
                     AboutInfoLine("许可", "GPL-3.0")
                 }
             }

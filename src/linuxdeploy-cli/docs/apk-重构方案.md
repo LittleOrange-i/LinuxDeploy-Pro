@@ -47,7 +47,7 @@
 ## 五、安全
 
 - `allowBackup=false`，无明文 HTTP，详情页不展示明文密码。
-- 包名 `io.github.ganyu256.linuxdeploypro`。
+- 包名 `io.github.LittleOrange.linuxdeploypro`。
 - release 签名使用本地 keystore（不入库），见 `keystore/README.md`。
 
 ## 六、里程碑

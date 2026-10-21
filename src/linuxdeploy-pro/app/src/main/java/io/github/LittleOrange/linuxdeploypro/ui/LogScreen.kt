@@ -1,4 +1,4 @@
-package io.github.ganyu256.linuxdeploypro.ui
+package io.github.LittleOrange.linuxdeploypro.ui
 
 import android.content.ClipData
 import android.content.Context

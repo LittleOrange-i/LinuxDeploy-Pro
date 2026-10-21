@@ -1,12 +1,12 @@
-package io.github.ganyu256.linuxdeploypro
+package io.github.LittleOrange.linuxdeploypro
 
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import io.github.ganyu256.linuxdeploypro.data.CliManager
-import io.github.ganyu256.linuxdeploypro.data.ConfigStore
-import io.github.ganyu256.linuxdeploypro.data.ContainerKeepAliveService
+import io.github.LittleOrange.linuxdeploypro.data.CliManager
+import io.github.LittleOrange.linuxdeploypro.data.ConfigStore
+import io.github.LittleOrange.linuxdeploypro.data.ContainerKeepAliveService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay

@@ -1,6 +1,6 @@
 # Linux Deploy CLI 4.1.20
 
-> 维护：GanYu256 | 全中文日志 | 无配置锁（统一 -c 指定配置） | 只维护 arm64
+> 维护：LittleOrange-i | 全中文日志 | 无配置锁（统一 -c 指定配置） | 只维护 arm64
 
 Linux Deploy CLI 是 LinuxDeploy-Pro 的命令行工具，提供 chroot 容器核心能力
 （构建、挂载、启动、停止、导入导出），命令层、配置管理与安全机制统一设计，
@@ -257,4 +257,4 @@ linuxdeploy/               项目根
 
 ## 许可证
 
-GPLv3。版权归 Anton Skshidlevsky 与 LinuxDeploy 社区；重构部分由 GanYu256 维护。
+GPLv3。版权归 Anton Skshidlevsky 与 LinuxDeploy 社区；重构部分由 LittleOrange-i 维护。

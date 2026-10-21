@@ -1,7 +1,7 @@
 #!/bin/sh
 # Linux Deploy Component
 # (c) Anton Skshidlevsky <meefik@gmail.com>, GPLv3
-# 维护：GanYu256（各发行版兼容修复）
+# 维护：LittleOrange-i（各发行版兼容修复）
 #
 # 本项目只维护 arm64（aarch64），Slackware 的 ARM 分支结构与 x86 完全不同：
 # 1) 目录：ARM 只有 <源>/slackwarearm/slackwareaarch64-current/（16.0 尚未正式发布，

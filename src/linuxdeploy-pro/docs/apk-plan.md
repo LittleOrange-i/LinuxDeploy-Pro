@@ -25,7 +25,7 @@
 - Kotlin + Jetpack Compose，AGP 9.3.1（内置 Kotlin），Compose 编译器 2.4.10
 - Compose BOM 2026.06.01，Miuix 0.9.3（HyperOS 风格组件库）
 - compileSdk 37（Miuix/core-ktx 最新版要求），targetSdk 36（Android 16），minSdk 28（私有二进制执行基线）
-- 包名 io.github.ganyu256.linuxdeploypro，图标蓝紫渐变 + 终端提示符
+- 包名 io.github.LittleOrange.linuxdeploypro，图标蓝紫渐变 + 终端提示符
 
 ## 四、执行后校验 / 无障碍
 

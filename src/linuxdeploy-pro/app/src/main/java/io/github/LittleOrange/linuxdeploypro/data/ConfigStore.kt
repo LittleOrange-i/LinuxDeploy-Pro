@@ -1,7 +1,7 @@
-package io.github.ganyu256.linuxdeploypro.data
+package io.github.LittleOrange.linuxdeploypro.data
 
 import android.content.Context
-import io.github.ganyu256.linuxdeploypro.model.ContainerConfig
+import io.github.LittleOrange.linuxdeploypro.model.ContainerConfig
 import java.io.File
 
 /**
