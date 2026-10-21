@@ -51,11 +51,14 @@ import io.github.ganyu256.linuxdeploypro.data.CliManager
 import io.github.ganyu256.linuxdeploypro.data.ConfigStore
 import io.github.ganyu256.linuxdeploypro.data.OpLogHub
 import io.github.ganyu256.linuxdeploypro.data.KeepAliveService
+import io.github.ganyu256.linuxdeploypro.data.ContainerKeepAliveService
 import io.github.ganyu256.linuxdeploypro.model.ContainerConfig
 import io.github.ganyu256.linuxdeploypro.ui.theme.ThemeMode
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -157,33 +160,68 @@ fun MainScreen(
      */
     val appendLog: (String) -> Unit = { msg -> OpLogHub.append(msg) }
 
+    /** 查询单个配置的实时运行状态（-c 查询，挂起；null=查询失败） */
+    suspend fun queryOneStatus(name: String): CliManager.ContainerStatus? =
+        withContext(Dispatchers.IO) {
+            try {
+                CliManager.getStatus(context, name)
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    /** 把查询到的状态写入 configs 列表与详情页（主线程调用） */
+    fun applyOneStatus(name: String, status: CliManager.ContainerStatus?) {
+        if (status == null) return
+        val idx = configs.indexOfFirst { it.name == name }
+        if (idx >= 0) {
+            configs[idx] = configs[idx].copy(
+                running = status.running,
+                sshRunning = status.sshRunning,
+                ipv4 = status.ipv4,
+            )
+        }
+        detailConfig = detailConfig?.takeIf { it.name == name }
+            ?.copy(
+                running = status.running,
+                sshRunning = status.sshRunning,
+                ipv4 = status.ipv4,
+            )
+    }
+
     /** 刷新单个配置的真实运行状态（-c 查询，不依赖操作结果） */
     fun refreshOneConfig(name: String) {
         scope.launch {
-            val status = withContext(Dispatchers.IO) {
-                try {
-                    CliManager.getStatus(context, name)
-                } catch (_: Exception) {
-                    null
-                }
-            }
-            if (status != null) {
-                val idx = configs.indexOfFirst { it.name == name }
-                if (idx >= 0) {
-                    configs[idx] = configs[idx].copy(
-                        running = status.running,
-                        sshRunning = status.sshRunning,
-                        ipv4 = status.ipv4,
-                    )
-                }
-                detailConfig = detailConfig?.takeIf { it.name == name }
-                    ?.copy(
-                        running = status.running,
-                        sshRunning = status.sshRunning,
-                        ipv4 = status.ipv4,
-                    )
+            applyOneStatus(name, queryOneStatus(name))
+        }
+    }
+
+    /** 刷新单个配置并等待状态落地（保活同步前需要确定的运行态时使用） */
+    suspend fun refreshOneConfigAwait(name: String) {
+        applyOneStatus(name, queryOneStatus(name))
+    }
+
+    /** 已停止的配置 status 也会带 IP；没拿到 IP 的（如 SSH 关闭）单独补查宿主 IP */
+    suspend fun patchMissingIpv4() {
+        val ip = withContext(Dispatchers.IO) {
+            try {
+                CliManager.hostIpv4(context)
+            } catch (_: Exception) {
+                ""
             }
         }
+        if (ip.isNotBlank()) {
+            for (i in configs.indices) {
+                if (configs[i].ipv4.isBlank()) configs[i] = configs[i].copy(ipv4 = ip)
+            }
+            detailConfig = detailConfig?.takeIf { it.ipv4.isBlank() }?.copy(ipv4 = ip)
+                ?: detailConfig
+        }
+    }
+
+    /** 并发刷新全部配置状态并等待全部落地（保活同步等需要确定运行态的联动使用） */
+    suspend fun refreshAllStatusesAwait() {
+        configs.toList().map { scope.async { refreshOneConfigAwait(it.name) } }.joinAll()
     }
 
     /** 静默刷新全部配置的运行状态（与启停后刷新同一路径） */
@@ -191,30 +229,17 @@ fun MainScreen(
         configs.toList().forEach { refreshOneConfig(it.name) }
         // 已停止的配置 status 也会带 IP；若仍有配置没拿到 IP（如 SSH 关闭），单独补查一次
         if (configs.any { it.ipv4.isBlank() }) {
-            scope.launch {
-                val ip = withContext(Dispatchers.IO) {
-                    try {
-                        CliManager.hostIpv4(context)
-                    } catch (_: Exception) {
-                        ""
-                    }
-                }
-                if (ip.isNotBlank()) {
-                    for (i in configs.indices) {
-                        if (configs[i].ipv4.isBlank()) configs[i] = configs[i].copy(ipv4 = ip)
-                    }
-                    detailConfig = detailConfig?.takeIf { it.ipv4.isBlank() }?.copy(ipv4 = ip)
-                        ?: detailConfig
-                }
-            }
+            scope.launch { patchMissingIpv4() }
         }
     }
 
     /**
      * 加载配置列表（直读 config/ 文件，毫秒级）并刷新运行状态（挂起版）。
      * 状态查询用 cli.sh -c <配置名> 显式指定，不触碰 .current 锁，无并发副作用。
+     * @param refreshStatus false 时不自动逐个刷新状态（调用方需要确定态时
+     *   自行用 refreshOneConfigAwait 逐个 await 后再做联动）
      */
-    suspend fun loadConfigsFromCli() {
+    suspend fun loadConfigsFromCli(refreshStatus: Boolean = true) {
         val list = withContext(Dispatchers.IO) {
             try {
                 CliManager.configListModels(context).toMutableList()
@@ -234,8 +259,15 @@ fun MainScreen(
                     ipv4 = old?.ipv4 ?: "",
                 )
             })
-            // 启动/刷新后逐配置刷新运行状态（与启停后刷新同一路径）
-            configs.toList().forEach { refreshOneConfig(it.name) }
+            // 启动/刷新后逐配置刷新运行状态（与启停后刷新同一路径）；
+            // 全部落地后按真实运行态对齐息屏保活——覆盖删除容器/配置、
+            // 部署完成等所有走本函数的路径，保证保活不空转、不遗漏
+            if (refreshStatus) {
+                scope.launch {
+                    refreshAllStatusesAwait()
+                    ContainerKeepAliveService.sync(context, configs.any { it.running })
+                }
+            }
         }
     }
 
@@ -508,10 +540,22 @@ fun MainScreen(
             },
             onSuccess = {
                 refreshOneConfig(latest.name)
+                // 息屏保活联动：启动成功 → 立即进入常驻保活；
+                // 停止成功 → 仅当还有其它运行中容器时才继续保活
+                if (wasRunning) {
+                    ContainerKeepAliveService.sync(
+                        context,
+                        configs.any { it.name != latest.name && it.running },
+                    )
+                } else {
+                    ContainerKeepAliveService.sync(context, true)
+                }
             },
             onFailure = {
                 // 启动/停止即使部分失败也刷新真实状态（CLI start 已容错）
                 refreshOneConfig(latest.name)
+                // 按已知状态兜底同步（结果与预期不符时保活仍能对齐真实运行态）
+                ContainerKeepAliveService.sync(context, configs.any { it.running })
             },
             // 兜底超时：启停正常在十秒级完成，卡住时强制终止并释放 busy
             timeoutMs = 10 * 60 * 1000L,
@@ -788,7 +832,13 @@ fun MainScreen(
         withContext(Dispatchers.IO) {
             CliManager.ensureConfigWritable(context)
         }
-        reloadConfigs()
+        // 不走 reloadConfigs（内部异步逐个刷新，完成时机不确定）：
+        // 这里需要拿到确定的运行状态后再做保活同步，并发刷新并 await
+        loadConfigsFromCli(refreshStatus = false)
+        refreshAllStatusesAwait()
+        // 息屏保活补同步：容器可能由开机自启拉起，或上次运行期间 App 进程
+        // 被杀重启（保活服务随之消失）——按真实运行状态对齐
+        ContainerKeepAliveService.sync(context, configs.any { it.running })
         // busy 自动恢复：若操作异常挂起超过 20 分钟仍未结束，强制解除
         while (true) {
             kotlinx.coroutines.delay(60_000)
@@ -813,6 +863,9 @@ fun MainScreen(
                     firstResume = false
                 } else {
                     refreshRunning()
+                    // 保活自愈保险：从系统设置/后台返回时按已知状态对齐一次
+                    // （用户可能在系统设置里动过电池优化，或保活服务被 ROM 杀掉）
+                    ContainerKeepAliveService.sync(context, configs.any { it.running })
                 }
             }
         }
@@ -832,6 +885,12 @@ fun MainScreen(
             SettingsScreen(
                 themeMode = themeMode,
                 onThemeModeChange = onThemeModeChange,
+                // 保活分组：展示当前是否有容器在跑（configs 为 Compose 状态，
+                // 运行状态刷新后此值自动重算）；开关变更即时同步保活服务
+                containersRunning = configs.any { it.running },
+                onKeepAliveChanged = {
+                    ContainerKeepAliveService.sync(context, configs.any { it.running })
+                },
                 onBack = { popRoute() },
             )
         }

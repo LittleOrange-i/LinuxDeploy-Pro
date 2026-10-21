@@ -43,8 +43,11 @@ class KeepAliveService : Service() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "linuxdeploy:keepalive").apply {
             setReferenceCounted(false)
-            // 上限 30 分钟：防止异常路径未 stopService 时长时间占用 CPU 唤醒
-            acquire(30 * 60 * 1000L)
+            // 不设超时：部署兜底超时上限为 60 分钟，此前的 30 分钟上限会让
+            // "息屏 + 长部署"在 30 分钟后被挂起（任务假死直至超时被杀）。
+            // 进程被杀时内核回收该进程全部 WakeLock；正常路径由 MainScreen
+            // stopService → onDestroy release，不会泄漏。
+            acquire()
         }
     }
 
@@ -75,7 +78,7 @@ class KeepAliveService : Service() {
     private fun buildNotification(): Notification =
         Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("LinuxDeploy")
-            .setContentText("长任务运行中，请保持应用打开")
+            .setContentText("长任务运行中，可返回桌面或息屏")
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_PROGRESS)

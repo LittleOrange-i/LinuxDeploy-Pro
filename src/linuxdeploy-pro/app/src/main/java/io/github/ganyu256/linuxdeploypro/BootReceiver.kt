@@ -6,6 +6,7 @@ import android.content.Intent
 import android.util.Log
 import io.github.ganyu256.linuxdeploypro.data.CliManager
 import io.github.ganyu256.linuxdeploypro.data.ConfigStore
+import io.github.ganyu256.linuxdeploypro.data.ContainerKeepAliveService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -20,6 +21,7 @@ class BootReceiver : BroadcastReceiver() {
         // 而重试等待期间协程仍在运行
         val appContext = context.applicationContext
         CoroutineScope(Dispatchers.IO).launch {
+            var anyStarted = false
             ConfigStore.autostartList(appContext).forEach { name ->
                 var attempt = 0
                 var started = false
@@ -41,10 +43,15 @@ class BootReceiver : BroadcastReceiver() {
                 }
                 if (started) {
                     Log.i(TAG, "自启成功：$name")
+                    anyStarted = true
                 } else {
                     Log.e(TAG, "自启最终失败（已重试 $MAX_ATTEMPTS 次）：$name")
                 }
             }
+            // 息屏保活联动：有容器成功启动即拉起常驻保活服务（specialUse
+            // 前台服务允许 BOOT_COMPLETED 拉起，不受 Android 15 限制），
+            // 否则确保服务停止（保持默认开启，开机自启场景无需用户干预）
+            ContainerKeepAliveService.sync(appContext, anyStarted)
         }
     }
 

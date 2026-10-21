@@ -11,11 +11,11 @@ src/
 ```
 
 - **linuxdeploy-cli**：部署/启动/停止/配置管理 CLI。支持 Debian/Ubuntu/Kali/Archlinux/Fedora/Alpine等发行版
-- **linuxdeploy-pro**：Android App（minSdk 28 / targetSdk 36），内置最新 CLI 资源（`app/src/main/assets/linuxdeploy-cli/`），首次启动自动解压；支持配置管理、部署、启动/停止、容器内终端、开机自启。
+- **linuxdeploy-pro**：Android App（minSdk 28 / targetSdk 36），内置最新 CLI 资源（`app/src/main/assets/linuxdeploy-cli/`），首次启动自动解压；支持配置管理、部署、启动/停止、容器内终端、开机自启。容器运行期间支持息屏保活（specialUse 前台服务 + WakeLock / WifiLock，对应老版「保持 CPU 唤醒 / 锁定 WiFi」，设置页可开关）与电池优化白名单引导。
 
 ## 版本
 
-当前版本：**4.1.23**（CLI `VERSION` 与 App `versionCode 40123 / versionName 4.1.23` 保持一致；App 内置 CLI 资源的解压标记按 assets 内容指纹自动更新，版本变化时自动重新解压）。
+当前版本：**4.2.0**（CLI `VERSION` 与 App `versionCode 40200 / versionName 4.2.0` 保持一致；App 内置 CLI 资源的解压标记按 assets 内容指纹自动更新，版本变化时自动重新解压）。
 
 ## 构建
 

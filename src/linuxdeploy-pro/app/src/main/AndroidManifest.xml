@@ -10,6 +10,14 @@
     <!-- 长任务保活前台服务（部署/导出期间防进程回收与锁屏挂起） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 容器常驻保活前台服务（specialUse 类型不受 dataSync 6 小时/24h 限制，
+         且允许 BOOT_COMPLETED 拉起；容器运行期间息屏不掉线） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- WifiLock：息屏后阻止 WiFi 休眠（容器网络保持可用） -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- 电池优化白名单：深度休眠（Doze）下系统忽略非白名单应用的 WakeLock，
+         引导用户豁免后息屏保活才可靠 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!--
     allowBackup=false：容器配置含明文密码（CLI 需明文才能写容器 /etc/passwd），
@@ -41,6 +49,17 @@
             android:name=".data.KeepAliveService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- 容器常驻保活：容器运行期间持有 WakeLock/WifiLock，息屏不掉线。
+             specialUse 需声明 PROPERTY_SPECIAL_USE_FGS_SUBTYPE 说明用途 -->
+        <service
+            android:name=".data.ContainerKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="linux_chroot_container_keepalive：容器（chroot）运行期间保持 CPU 唤醒与 WiFi 可用，息屏后 SSH 等服务不中断" />
+        </service>
 
         <receiver
             android:name=".BootReceiver"
